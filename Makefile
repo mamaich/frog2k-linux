@@ -3125,16 +3125,24 @@ smoke-linux-qpsx-savestate: run-linux-qpsx-savestate
 # for absolute FPS because TCG does not model the HC15xx pipeline or caches.
 run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCHMARK_SD_TARGET)
 	mkdir -p '$(BUILD_DIR)'/logs
+	# Launch the game from the browser, then press nothing: Ridge Racer's
+	# attract sequence advances to the demo race by itself.  Unthrottled
+	# execution comes from the SF2000_UNCAPPED=1 cmdline flag (the frontend
+	# enables benchmark mode in code), never from holding START -- a long
+	# START hold trips the core's own 1.5-sec menu and the benchmark would
+	# measure menu render instead of the race.  The cmdline is baked into
+	# the kernel at build time (the sf2000 QEMU machine ignores -append for
+	# ASD loads), so the benchmark targets rebuild the test ASD with the
+	# extended command line; the non-default cmdline keeps SDCARD_ASD_SYNC=0
+	# and never touches the physical-device artifacts.
+	# x/down/x navigates the browser to the game; after launch no further
+	# key is pressed so Ridge Racer's attract sequence (title, menu, demo
+	# race) runs unkeyed and deterministically on the emulated frame
+	# timeline -- an in-game press would perturb the scene under test.
 	(sleep 5; printf 'sendkey x 100\n'; sleep 1; \
 		printf 'sendkey down 100\n'; sleep 1; \
 		printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
-		sleep 12; printf 'sendkey ret-backspace 2000\n'; sleep 2; \
-		printf 'sendkey down 200\n'; sleep 1; \
-		printf 'sendkey right 200\n'; sleep 0.3; \
-		printf 'sendkey right 200\n'; sleep 0.3; \
-		printf 'sendkey right 200\n'; sleep 0.3; \
-		printf 'sendkey right 200\n'; sleep 1; \
-		printf 'sendkey z 200\n'; sleep '$(QPSX_BENCHMARK_SECONDS)'; \
+		sleep '$(QPSX_BENCHMARK_SECONDS)'; \
 		printf 'quit\n') | \
 		SF2000_SCANOUT_ORACLE=0 '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
 		-kernel '$(BUILD_DIR)'/sf2000-linux-full.asd \
@@ -3144,7 +3152,9 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 		-D '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log \
 		> '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.console 2>&1
 
-benchmark-linux-qpsx-attract: run-linux-qpsx-attract-benchmark
+benchmark-linux-qpsx-attract:
+	$(MAKE) run-linux-qpsx-attract-benchmark \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1'
 	@awk '/QPSX: retro_run progress: frame (1200|1800)$$/ { \
 		line=$$0; sub(/^.*\[/, "", line); sub(/\].*$$/, "", line); \
 		time=line+0; frame=$$NF+0; if (frame == 1200) start=time; \
