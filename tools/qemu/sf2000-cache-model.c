@@ -92,6 +92,7 @@ typedef struct {
     uint64_t previous_instructions;
     uint64_t previous_i_misses;
     uint64_t previous_d_misses;
+    uint64_t previous_estimated_cycles;
     uint64_t instruction_penalty;
     uint64_t data_penalty;
     uint64_t insn_classes[INSN_CLASS_COUNT];
@@ -101,6 +102,7 @@ typedef struct {
     uint64_t core_end;
     int rec_base_auto;
     int core_only;
+    int emu_only;
     uint64_t rec_i_accesses;
     uint64_t rec_i_misses;
     uint64_t rec_d_accesses;
@@ -120,6 +122,16 @@ typedef struct {
     int rec_only;
     int phase_rec;
     int phase_active;
+    uint32_t frame_opcode;
+    uint64_t frame_number;
+    uint64_t frame_report_period;
+    uint64_t frame_stop;
+    uint64_t frame_previous_cycles;
+    uint64_t frame_cycle_sum;
+    uint64_t frame_cycle_values[4096];
+    size_t frame_cycle_count;
+    int frame_have_previous;
+    int frame_frozen;
     int have_previous;
     HotspotEntry *hot_table;
     size_t hot_capacity;
@@ -203,6 +215,9 @@ static int pc_is_core_code(uint64_t pc)
 
 static int pc_is_selected(uint64_t pc)
 {
+    if (model.emu_only) {
+        return pc_is_core_code(pc) || pc_is_rec_code(pc);
+    }
     if (model.core_only) {
         return pc_is_core_code(pc);
     }
@@ -214,6 +229,9 @@ static int pc_is_selected(uint64_t pc)
 
 static const char *scope_label(void)
 {
+    if (model.emu_only) {
+        return "emu";
+    }
     if (model.core_only) {
         return "core";
     }
@@ -222,6 +240,9 @@ static const char *scope_label(void)
 
 static const char *coverage_label(void)
 {
+    if (model.emu_only) {
+        return model.phase_rec ? "core+rec-post-rec" : "core+rec";
+    }
     if (model.core_only) {
         return "core-text";
     }
@@ -269,6 +290,7 @@ static void rec_code_observe(uint64_t pc)
 static int cache_access(Cache *cache, uint64_t address);
 static int cache_access_indexed(Cache *cache, uint64_t tag_address,
                                 uint64_t index_address);
+static void clear_hotspot_counts(void);
 
 /* A MIPS dynarec patches branch targets and emits new blocks with ordinary
  * stores, followed by a small instruction-cache flush.  QEMU's plugin API
@@ -449,8 +471,6 @@ static void cache_reset(Cache *cache)
  * generated-code PC. */
 static void reset_measurement(void)
 {
-    size_t index;
-
     cache_reset(&model.icache);
     cache_reset(&model.dcache);
     model.instructions = 0;
@@ -470,6 +490,7 @@ static void reset_measurement(void)
     model.previous_instructions = 0;
     model.previous_i_misses = 0;
     model.previous_d_misses = 0;
+    model.previous_estimated_cycles = 0;
     model.have_previous = 0;
     memset(model.insn_classes, 0, sizeof(model.insn_classes));
     model.rec_i_accesses = 0;
@@ -488,18 +509,11 @@ static void reset_measurement(void)
         memset(model.rec_line_bits, 0,
                (model.rec_line_count + 7) / 8);
     }
-    if (model.hot_table) {
-        for (index = 0; index < model.hot_capacity; index++) {
-            model.hot_table[index].executions = 0;
-            model.hot_table[index].i_misses = 0;
-            model.hot_table[index].d_accesses = 0;
-            model.hot_table[index].d_misses = 0;
-            model.hot_table[index].first_d_miss_address = 0;
-            model.hot_table[index].last_d_miss_address = 0;
-            model.hot_table[index].first_d_miss_vaddr = 0;
-            model.hot_table[index].last_d_miss_vaddr = 0;
-        }
-    }
+    model.frame_previous_cycles = 0;
+    model.frame_cycle_sum = 0;
+    model.frame_cycle_count = 0;
+    model.frame_have_previous = 0;
+    clear_hotspot_counts();
 }
 
 static uint64_t parse_u64(const char *text, uint64_t fallback)
@@ -546,6 +560,57 @@ static uint64_t hotspot_penalty(const HotspotEntry *entry)
            entry->d_misses * model.data_penalty;
 }
 
+static uint64_t estimated_cycles_now(void)
+{
+    return model.instructions +
+           model.i_misses * model.instruction_penalty +
+           model.d_misses * model.data_penalty;
+}
+
+static int compare_u64(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+
+    return a < b ? -1 : a > b;
+}
+
+static uint64_t frame_percentile(unsigned int permille)
+{
+    uint64_t rank;
+
+    if (model.frame_cycle_count == 0) {
+        return 0;
+    }
+    rank = ((uint64_t)model.frame_cycle_count * permille + 999) / 1000;
+    if (rank == 0) {
+        rank = 1;
+    }
+    if (rank > model.frame_cycle_count) {
+        rank = model.frame_cycle_count;
+    }
+    return model.frame_cycle_values[rank - 1];
+}
+
+static void clear_hotspot_counts(void)
+{
+    size_t index;
+
+    if (!model.hot_table) {
+        return;
+    }
+    for (index = 0; index < model.hot_capacity; index++) {
+        model.hot_table[index].executions = 0;
+        model.hot_table[index].i_misses = 0;
+        model.hot_table[index].d_accesses = 0;
+        model.hot_table[index].d_misses = 0;
+        model.hot_table[index].first_d_miss_address = 0;
+        model.hot_table[index].last_d_miss_address = 0;
+        model.hot_table[index].first_d_miss_vaddr = 0;
+        model.hot_table[index].last_d_miss_vaddr = 0;
+    }
+}
+
 static void write_hotspots(const char *kind)
 {
     HotspotEntry *top[32] = { 0 };
@@ -586,12 +651,12 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=11 sample=%" PRIu64
+            "# sf2000-cache-model hotspots version=12 sample=%" PRIu64
             " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
-            " label=%s\n",
+            " frame=%" PRIu64 " label=%s\n",
             model.sample_no, kind, model.instructions,
             scope_label(),
-            coverage_label(), model.label);
+            coverage_label(), model.frame_number, model.label);
     for (rank = 0; rank < sizeof(top) / sizeof(top[0]); rank++) {
         HotspotEntry *entry = top[rank];
 
@@ -636,6 +701,13 @@ static void write_report(const char *kind)
     uint64_t delta_instructions;
     uint64_t delta_i_misses;
     uint64_t delta_d_misses;
+    uint64_t delta_estimated_cycles;
+    uint64_t frame_average_cycles;
+    uint64_t frame_p95_cycles;
+    uint64_t frame_p98_cycles;
+    uint64_t frame_p99_cycles;
+    uint64_t frame_p999_cycles;
+    uint64_t frame_max_cycles;
     uint64_t helper_i_accesses;
     uint64_t helper_i_misses;
     uint64_t helper_d_accesses;
@@ -648,9 +720,18 @@ static void write_report(const char *kind)
     if (!model.out) {
         return;
     }
-    estimated_cycles = model.instructions +
-        model.i_misses * model.instruction_penalty +
-        model.d_misses * model.data_penalty;
+    estimated_cycles = estimated_cycles_now();
+    frame_average_cycles = model.frame_cycle_count ?
+        model.frame_cycle_sum / model.frame_cycle_count : 0;
+    if (model.frame_cycle_count) {
+        qsort(model.frame_cycle_values, model.frame_cycle_count,
+              sizeof(model.frame_cycle_values[0]), compare_u64);
+    }
+    frame_p95_cycles = frame_percentile(950);
+    frame_p98_cycles = frame_percentile(980);
+    frame_p99_cycles = frame_percentile(990);
+    frame_p999_cycles = frame_percentile(999);
+    frame_max_cycles = frame_percentile(1000);
     i_miss_ppm = ratio_ppm(model.i_misses, model.i_accesses);
     d_miss_ppm = ratio_ppm(model.d_misses, model.d_lines);
     rec_i_ppm = ratio_ppm(model.rec_i_accesses, model.i_accesses);
@@ -690,15 +771,25 @@ static void write_report(const char *kind)
         delta_instructions = model.instructions - model.previous_instructions;
         delta_i_misses = model.i_misses - model.previous_i_misses;
         delta_d_misses = model.d_misses - model.previous_d_misses;
+        delta_estimated_cycles = estimated_cycles -
+                                 model.previous_estimated_cycles;
     } else {
         delta_instructions = model.instructions;
         delta_i_misses = model.i_misses;
         delta_d_misses = model.d_misses;
+        delta_estimated_cycles = estimated_cycles;
     }
     model.sample_no++;
     fprintf(model.out,
             "sample=%" PRIu64 " kind=%s label=%s instructions=%" PRIu64
             " scope=%s coverage=%s recbase=0x%016" PRIx64
+            " frame=%" PRIu64 " frame_samples=%zu"
+            " frame_avg_cycles=%" PRIu64
+            " frame_p95_cycles=%" PRIu64
+            " frame_p98_cycles=%" PRIu64
+            " frame_p99_cycles=%" PRIu64
+            " frame_p999_cycles=%" PRIu64
+            " frame_max_cycles=%" PRIu64
             " i_accesses=%" PRIu64 " i_misses=%" PRIu64
             " i_invalidations=%" PRIu64
             " d_accesses=%" PRIu64 " d_lines=%" PRIu64
@@ -727,6 +818,9 @@ static void write_report(const char *kind)
             " rec_d_size1=%" PRIu64 " rec_d_size2=%" PRIu64
             " rec_d_size4=%" PRIu64 " rec_d_size8p=%" PRIu64
             " rec_d_misses=%" PRIu64
+            " core_instructions=%" PRIu64
+            " core_i_accesses=%" PRIu64 " core_i_misses=%" PRIu64
+            " core_d_accesses=%" PRIu64 " core_d_misses=%" PRIu64
             " native_instructions=%" PRIu64
             " native_d_accesses=%" PRIu64 " native_d_lines=%" PRIu64
             " native_d_bytes=%" PRIu64 " native_d_size1=%" PRIu64
@@ -739,10 +833,14 @@ static void write_report(const char *kind)
             " helper_d_misses=%" PRIu64 " helper_d_miss_ppm=%" PRIu64
             " helper_d_miss_share_ppm=%" PRIu64
             " est_cycles=%" PRIu64 " delta_instructions=%" PRIu64
-            " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64 "\n",
+            " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64
+            " delta_est_cycles=%" PRIu64 "\n",
             model.sample_no, kind, model.label, model.instructions,
             scope_label(),
             coverage_label(), model.rec_base,
+            model.frame_number, model.frame_cycle_count,
+            frame_average_cycles, frame_p95_cycles, frame_p98_cycles,
+            frame_p99_cycles, frame_p999_cycles, frame_max_cycles,
             model.i_accesses, model.i_misses, model.i_invalidations,
             model.d_accesses,
             model.d_lines, model.d_bytes, model.d_size_counts[0],
@@ -770,7 +868,10 @@ static void write_report(const char *kind)
             model.rec_d_accesses, model.rec_d_bytes,
             model.rec_d_size_counts[0], model.rec_d_size_counts[1],
             model.rec_d_size_counts[2], model.rec_d_size_counts[3],
-            model.rec_d_misses, helper_instructions,
+            model.rec_d_misses,
+            helper_instructions, helper_i_accesses, helper_i_misses,
+            helper_d_accesses, helper_d_misses,
+            helper_instructions,
             helper_d_accesses, helper_d_lines, helper_d_bytes,
             helper_d_size_counts[0], helper_d_size_counts[1],
             helper_d_size_counts[2], helper_d_size_counts[3],
@@ -782,24 +883,70 @@ static void write_report(const char *kind)
             ratio_ppm(helper_d_misses, helper_d_lines),
             ratio_ppm(helper_d_misses, model.d_misses),
             estimated_cycles, delta_instructions, delta_i_misses,
-            delta_d_misses);
+            delta_d_misses, delta_estimated_cycles);
     fflush(model.out);
     model.previous_instructions = model.instructions;
     model.previous_i_misses = model.i_misses;
     model.previous_d_misses = model.d_misses;
+    model.previous_estimated_cycles = estimated_cycles;
     model.have_previous = 1;
     write_hotspots(kind);
 }
 
 static void maybe_report(void)
 {
-    if (model.sample == 0 || model.instructions < model.next_sample) {
+    if (model.frame_opcode || model.sample == 0 ||
+        model.instructions < model.next_sample) {
         return;
     }
     do {
         model.next_sample += model.sample;
     } while (model.next_sample <= model.instructions);
     write_report("periodic");
+}
+
+static void frame_marker_exec(unsigned int vcpu_index, void *userdata)
+{
+    uint64_t cycles;
+    uint64_t frame_cycles;
+    int report_now;
+
+    (void)vcpu_index;
+    (void)userdata;
+    if (model.frame_frozen) {
+        return;
+    }
+    model.frame_number++;
+    if (model.phase_rec && !model.phase_active) {
+        return;
+    }
+    cycles = estimated_cycles_now();
+    if (model.frame_have_previous) {
+        frame_cycles = cycles - model.frame_previous_cycles;
+        if (model.frame_cycle_count <
+            sizeof(model.frame_cycle_values) /
+            sizeof(model.frame_cycle_values[0])) {
+            model.frame_cycle_values[model.frame_cycle_count++] = frame_cycles;
+            model.frame_cycle_sum += frame_cycles;
+        }
+    }
+    model.frame_previous_cycles = cycles;
+    model.frame_have_previous = 1;
+
+    report_now = model.frame_report_period &&
+                 model.frame_number % model.frame_report_period == 0;
+    if (model.frame_stop && model.frame_number >= model.frame_stop) {
+        report_now = 1;
+    }
+    if (report_now) {
+        write_report("frame");
+        model.frame_cycle_sum = 0;
+        model.frame_cycle_count = 0;
+        clear_hotspot_counts();
+    }
+    if (model.frame_stop && model.frame_number >= model.frame_stop) {
+        model.frame_frozen = 1;
+    }
 }
 
 static void tb_exec(unsigned int vcpu_index, void *userdata)
@@ -809,6 +956,9 @@ static void tb_exec(unsigned int vcpu_index, void *userdata)
     int rec_tb_seen = 0;
 
     (void)vcpu_index;
+    if (model.frame_frozen) {
+        return;
+    }
     /* During rec-phase setup, most TBs are kernel/loader code.  The previous
      * implementation checked every instruction in each of those TBs, which
      * made the diagnostic plugin slow the boot so much that it never reached
@@ -867,6 +1017,9 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     int rec_code_store;
 
     (void)vcpu_index;
+    if (model.frame_frozen) {
+        return;
+    }
     if (model.phase_rec && !model.phase_active) {
         return;
     }
@@ -1022,7 +1175,22 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * recRAM block are still measured, and the generated-code microscope is
      * unchanged.  The report labels this as phase=rec so callers do not
      * mistake it for a boot-inclusive profile. */
-    if (model.core_only) {
+    if (model.emu_only) {
+        for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
+            uint64_t pc = qemu_plugin_insn_vaddr(insn);
+
+            if (pc_is_core_code(pc)) {
+                core_count++;
+            }
+            if (pc_is_rec_code(pc)) {
+                rec_count++;
+            }
+        }
+        if (core_count == 0 && rec_count == 0) {
+            return;
+        }
+    } else if (model.core_only) {
         for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
 
@@ -1124,6 +1292,11 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                                              QEMU_PLUGIN_CB_NO_REGS,
                                              QEMU_PLUGIN_MEM_RW, mem_userdata);
         }
+        if (model.frame_opcode && opcode == model.frame_opcode &&
+            pc_is_core_code(data->pc[index])) {
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, frame_marker_exec, QEMU_PLUGIN_CB_NO_REGS, NULL);
+        }
     }
     qemu_plugin_register_vcpu_tb_exec_cb(tb, tb_exec,
                                          QEMU_PLUGIN_CB_NO_REGS, data);
@@ -1134,7 +1307,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
 {
     (void)id;
     (void)userdata;
-    write_report("exit");
+    if (!model.frame_frozen) {
+        write_report("exit");
+    }
     cache_destroy(&model.icache);
     cache_destroy(&model.dcache);
     free(model.rec_line_bits);
@@ -1178,6 +1353,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     model.i_vipt = 1;
     model.rec_only = 0;
     model.core_only = 0;
+    model.emu_only = 0;
     model.phase_rec = 0;
     model.phase_active = 1;
     snprintf(model.label, sizeof(model.label), "sf2000");
@@ -1233,15 +1409,22 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             if (strcmp(value, "all") == 0) {
                 model.rec_only = 0;
                 model.core_only = 0;
+                model.emu_only = 0;
             } else if (strcmp(value, "rec") == 0) {
                 model.rec_only = 1;
                 model.core_only = 0;
+                model.emu_only = 0;
             } else if (strcmp(value, "core") == 0) {
                 model.rec_only = 0;
                 model.core_only = 1;
+                model.emu_only = 0;
+            } else if (strcmp(value, "emu") == 0) {
+                model.rec_only = 0;
+                model.core_only = 0;
+                model.emu_only = 1;
             } else {
                 fprintf(stderr,
-                        "sf2000-cache-model: scope must be all, rec or core\n");
+                        "sf2000-cache-model: scope must be all, rec, core or emu\n");
                 return -1;
             }
         } else if (key_length == 3 && strncmp(key, "out", key_length) == 0) {
@@ -1264,6 +1447,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             core_base = parse_u64(value, core_base);
         } else if (key_length == 8 && strncmp(key, "coresize", key_length) == 0) {
             core_size = parse_u64(value, core_size);
+        } else if (key_length == 11 && strncmp(key, "frameopcode", key_length) == 0) {
+            model.frame_opcode = (uint32_t)parse_u64(value, 0);
+        } else if (key_length == 11 && strncmp(key, "framereport", key_length) == 0) {
+            model.frame_report_period = parse_u64(value, 0);
+        } else if (key_length == 9 && strncmp(key, "framestop", key_length) == 0) {
+            model.frame_stop = parse_u64(value, 0);
         } else {
             fprintf(stderr, "sf2000-cache-model: unknown option '%s'\n",
                     argv[index]);
@@ -1329,13 +1518,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=11 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=12 target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
             " recbase_mode=%s recsize=0x%016" PRIx64
             " imode=%s phase=%s scope=%s corebase=0x%016" PRIx64
             " coresize=0x%016" PRIx64
+            " frameopcode=0x%08" PRIx32
+            " framereport=%" PRIu64 " framestop=%" PRIu64
             " coverage=%s\n",
             info->target_name ? info->target_name : "unknown", size, line,
             ways, model.sample, model.instruction_penalty, model.data_penalty,
@@ -1344,6 +1535,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             model.i_vipt ? "vipt" : "pipt",
             model.phase_rec ? "rec" : "boot", scope_label(),
             model.core_base, model.core_end - model.core_base,
+            model.frame_opcode, model.frame_report_period, model.frame_stop,
             coverage_label());
     fflush(model.out);
     model.next_sample = model.sample;

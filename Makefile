@@ -526,7 +526,7 @@ QEMU_CACHE_MODEL_PHASE ?= rec
 # `rec` is the low-overhead generated-code microscope.  Use `all` with
 # phase=rec for a slower post-rec pass that includes recompiler helpers and
 # frontend-side instructions after the first recRAM block executes.
-QEMU_CACHE_MODEL_SCOPE ?= rec
+QEMU_CACHE_MODEL_SCOPE ?= emu
 QEMU_CACHE_MODEL_SAMPLE ?= 10000000
 QEMU_CACHE_MODEL_IPENALTY ?= 8
 QEMU_CACHE_MODEL_DPENALTY ?= 12
@@ -536,6 +536,12 @@ QEMU_CACHE_MODEL_LABEL ?= qpsx
 # layout changes while keeping scope=core far cheaper than scope=all.
 QEMU_CACHE_MODEL_COREBASE ?= 0x83000000
 QEMU_CACHE_MODEL_CORESIZE ?= 0x120000
+# Development QPSX cores execute this harmless encoded no-op once per
+# retro_run. The plugin uses it to emit exact 300-frame work/tail reports and
+# freezes counters at the benchmark endpoint, independent of host polling.
+QEMU_CACHE_MODEL_FRAME_OPCODE ?= 0x000007c0
+QEMU_CACHE_MODEL_FRAME_REPORT ?= 300
+QEMU_CACHE_MODEL_FRAME_STOP ?= $(QEMU_CACHE_MODEL_FRAMES)
 # recMem is printed by QPSX at startup.  Source/flag changes move the static
 # buffer by a few hundred bytes, so the default plugin mode uses a conservative
 # executable-only 8.5 MiB window and reports the observed rec PC range.  Pass
@@ -544,6 +550,8 @@ QEMU_CACHE_MODEL_RECBASE ?= auto
 QEMU_CACHE_MODEL_RECSIZE ?= 0x880000
 QEMU_CACHE_MODEL_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-model.log
 QEMU_CACHE_MODEL_HOT_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-hotspots.log
+QEMU_CACHE_COMPARE_LOGS ?=
+QEMU_CACHE_COMPARE_START_FRAME ?= 900
 GE_VENDOR_ARCHIVE ?= $(HCRTOS_SDK_DIR)/lib/vendor/libge.a
 GE_REVERSE_DIR := $(BUILD_DIR)/reverse-ge
 GE_NODE_TEST := $(BUILD_DIR)/hcge-node-test
@@ -616,6 +624,7 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
 	benchmark-linux-qpsx-attract-dev \
 	benchmark-linux-qpsx-cache-model-fast \
+	qpsx-cache-oracle-compare \
 	qpsx-no-menu-physical \
 	gpsp-smc-test-roms run-linux-gpsp-smc smoke-linux-gpsp-smc \
 	run-linux-frontend-lifecycle smoke-linux-frontend-lifecycle \
@@ -675,6 +684,7 @@ help:
 		'make qpsx-production-sweep  build four named QPSX physical A/B variants (QPSX_RUNTIME_TELEMETRY=0 for final)' \
 		'make qpsx-production-benchmark  run the four variants against one no-menu QEMU image' \
 		'make qpsx-stage-variant QPSX_VARIANT=baseline  copy one swept core into the existing test SD image' \
+		'make qpsx-cache-oracle-compare QEMU_CACHE_COMPARE_LOGS="control.log candidate.log"  compare exact-frame QPSX model tails' \
 		'make qpsx-dev-real-test-sd QPSX_REAL_IMAGE=...  rebuild/stage the incremental profiler QPSX core' \
 		'make smoke-linux-full-ge-no-irq  boot with the GE completion IRQ suppressed' \
 		'make smoke-linux-full-stale-ram  boot with stale garbage prefill in RAM' \
@@ -3398,9 +3408,10 @@ QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
 # by physical SF2000/GB300 kernel logs. QEMU's stock 24Kc CP0 currently reports
 # 2 KiB, so pass QEMU_CACHE_MODEL_SIZE=2048 to model that QEMU mismatch.
 # `scope=rec` measures generated PlayStation blocks; `scope=core` measures the
-# loaded QPSX static text in the small 0x83000000 window and is the appropriate
-# directional profile for C/assembly raster changes. `scope=all` remains a
-# forensic mode because instrumenting every Linux/helper instruction is slow.
+# static frontend/QPSX executable text in the small 0x83000000 window.
+# `scope=emu` combines both and retains callbacks for static functions already
+# translated before the first recRAM block, making it the default oracle.
+# `scope=all` remains a forensic mode because instrumenting Linux is slow.
 # The default recbase=auto window follows static Linux PIE layouts; pass an
 # exact QEMU_CACHE_MODEL_RECBASE when the core is deliberately linked outside
 # the normal 0x832xxxxx recMem window.
@@ -3417,7 +3428,7 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
 		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
@@ -3429,9 +3440,12 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	fi
 	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
-	grep -q 'sf2000-frontend: benchmark frame limit reached' \
-		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	# The host monitor intentionally quits as soon as the core logs the exact
+	# endpoint, so it may preempt the frontend's next benchmark-limit message.
+	# The independent core progress line plus plugin frame record are the two
+	# correctness checks; requiring the racy third line rejects complete runs.
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
 	@tail -n 5 '$(QEMU_CACHE_MODEL_LOG)'
 	@test -s '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	@sed -n '1,12p' '$(QEMU_CACHE_MODEL_HOT_LOG)'
@@ -3459,7 +3473,7 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
 		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
@@ -3471,12 +3485,36 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	fi
 	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
-	$(if $(filter 1,$(QPSX_BENCHMARK_REBUILD_ASD)),\
-		grep -q 'sf2000-frontend: benchmark frame limit reached' \
-			'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log',\
-		@printf '%s\n' 'QEMU cache model: reusing ASD; frame-limit marker intentionally not required')
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
 	@tail -n 3 '$(QEMU_CACHE_MODEL_LOG)'
+
+# Compare exact-frame oracle logs in one stable table. The first file is the
+# control; later rows report their modeled-cycle deltas at each common frame.
+# Starting at frame 900 excludes Ridge Racer's inexpensive pre-race lead-in.
+qpsx-cache-oracle-compare:
+	@test -n '$(strip $(QEMU_CACHE_COMPARE_LOGS))' || { \
+		echo 'set QEMU_CACHE_COMPARE_LOGS="control.log candidate.log ..."' >&2; exit 2; }
+	@for log in $(QEMU_CACHE_COMPARE_LOGS); do \
+		test -s "$$log" || { echo "missing oracle log: $$log" >&2; exit 2; }; \
+	done
+	@awk -v start='$(QEMU_CACHE_COMPARE_START_FRAME)' '\
+	function value(name, i,a) { \
+		for (i = 1; i <= NF; i++) { split($$i, a, "="); if (a[1] == name) return a[2] + 0 } \
+		return -1 \
+	} \
+	FNR == 1 { file_no++ } \
+	/kind=frame/ { \
+		frame=value("frame"); if (frame < start) next; \
+		label=""; for (i=1; i<=NF; i++) if ($$i ~ /^label=/) { label=$$i; sub(/^label=/,"",label) } \
+		avg=value("frame_avg_cycles"); p95=value("frame_p95_cycles"); \
+		p98=value("frame_p98_cycles"); p99=value("frame_p99_cycles"); \
+		p999=value("frame_p999_cycles"); \
+		if (file_no == 1) { base[frame]=avg; delta=0 } \
+		else if (base[frame] > 0) delta=100*(avg/base[frame]-1); else next; \
+		printf "%-24s frame=%4d avg=%10d p95=%10d p98=%10d p99=%10d p999=%10d avg_delta=%+7.3f%%\n", \
+			label,frame,avg,p95,p98,p99,p999,delta \
+	}' $(QEMU_CACHE_COMPARE_LOGS)
 
 run-linux-gpsp-smc: gpsp-smc-test-roms
 	@case ' $(GPSP_SMC_TEST_MODES) ' in \
