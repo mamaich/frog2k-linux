@@ -441,6 +441,7 @@ QPSX_REAL_TEST_BASE_PROFILE := $(BUILD_DIR)/qpsx-real-test.base-profile
 QPSX_REAL_TEST_CORE_PROFILE := $(BUILD_DIR)/qpsx-real-test.core-profile
 QPSX_REAL_TEST_CORE_STAMP := $(BUILD_DIR)/qpsx-real-test.core-installed
 QPSX_OPTIMIZE ?= -O2
+QPSX_RUNTIME_TELEMETRY ?= 1
 QPSX_TEST_CORE ?= $(BUILD_DIR)/sdcard/sf2000/cores/sf2000-qpsx
 QPSX_VARIANT ?= baseline
 QPSX_VARIANTS_DIR := $(FRONTEND_PROJECT)/build/qpsx-variants
@@ -603,7 +604,7 @@ help:
 		'make METRICS_LOG=loglinux.txt metrics-frontend  summarize emulator sessions' \
 		'make smoke-linux-full-asd  boot the full-rootfs artifact in QEMU' \
 		'make qpsx-production-real-test-sd QPSX_REAL_IMAGE=...  rebuild/audit/stage only the production QPSX core' \
-		'make qpsx-production-sweep  build four named QPSX physical A/B variants' \
+		'make qpsx-production-sweep  build four named QPSX physical A/B variants (QPSX_RUNTIME_TELEMETRY=0 for final)' \
 		'make qpsx-production-benchmark  run the four variants against one no-menu QEMU image' \
 		'make qpsx-stage-variant QPSX_VARIANT=baseline  copy one swept core into the existing test SD image' \
 		'make qpsx-dev-real-test-sd QPSX_REAL_IMAGE=...  rebuild/stage the incremental profiler QPSX core' \
@@ -2736,6 +2737,7 @@ qpsx-real-test-sd: $(QPSX_REAL_TEST_CORE_STAMP)
 qpsx-production-real-test-sd: FORCE
 	$(FRONTEND_MAKE) qpsx-mips32r1-audit \
 		QPSX_AUDIT_EXECUTABLE='build/sf2000-qpsx' \
+		QPSX_RUNTIME_TELEMETRY='$(QPSX_RUNTIME_TELEMETRY)' \
 		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))'
 	$(MAKE) qpsx-real-test-sd QPSX_REAL_CORE_DEP= \
 		QPSX_TEST_CORE='$(FRONTEND_PROJECT)/build/sf2000-qpsx'
@@ -2746,7 +2748,8 @@ qpsx-production-real-test-sd: FORCE
 qpsx-production-sweep: FORCE
 	$(FRONTEND_MAKE) qpsx-production-sweep \
 		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))' \
-		QPSX_OPTIMIZE='$(QPSX_OPTIMIZE)'
+		QPSX_OPTIMIZE='$(QPSX_OPTIMIZE)' \
+		QPSX_RUNTIME_TELEMETRY='$(QPSX_RUNTIME_TELEMETRY)'
 
 # Run the complete production matrix against the same already-built, no-menu
 # SD image.  The image is deliberately not a prerequisite: recreating a 128 MiB
@@ -2775,7 +2778,11 @@ qpsx-production-benchmark: qpsx-production-sweep FORCE
 		grep 'QPSX Ridge Racer attract benchmark:' "$$out/$$variant.make.log" | tail -n 1 | \
 			sed "s/^/$$variant /" | tee -a "$$out/SUMMARY"; \
 		grep -m 1 'QPSX: build knobs' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
-		grep -m 1 'QPSX: rec telemetry' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
+		if test '$(QPSX_RUNTIME_TELEMETRY)' = 1; then \
+			grep -m 1 'QPSX: rec telemetry' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
+		else \
+			printf '%s telemetry=disabled\\n' "$$variant" | tee -a "$$out/SUMMARY"; \
+		fi; \
 	done; \
 	cat "$$out/SUMMARY"
 
