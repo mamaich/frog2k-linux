@@ -76,6 +76,33 @@ static void check_bit_exact(uint32_t input_rate, uint32_t output_rate)
 	assert(optimized.have_previous == reference.have_previous);
 }
 
+static void check_unity_capacity(void)
+{
+	struct hc15xx_resampler optimized;
+	struct hc15xx_resampler reference;
+	int16_t stereo[] = {
+		INT16_MIN, INT16_MAX, 100, 101, -101, -100,
+		30000, 20000, -30000, -20000,
+	};
+	int16_t optimized_output[5];
+	int16_t reference_output[5];
+	size_t optimized_count;
+	size_t reference_count;
+
+	assert(hc15xx_resampler_init(&optimized, 44100, 44100) == 0);
+	reference = optimized;
+	optimized_count = hc15xx_resampler_process_stereo_s16(&optimized,
+		stereo, 5, optimized_output, 3);
+	reference_count = reference_process(&reference, stereo, 5,
+		reference_output, 3);
+	assert(optimized_count == reference_count);
+	assert(!memcmp(optimized_output, reference_output,
+		optimized_count * sizeof(*optimized_output)));
+	assert(optimized.phase == reference.phase);
+	assert(optimized.previous == reference.previous);
+	assert(optimized.have_previous == reference.have_previous);
+}
+
 int main(void)
 {
 	struct hc15xx_resampler state;
@@ -123,6 +150,7 @@ int main(void)
 	check_bit_exact(65535, 65534);
 	check_bit_exact(65534, 65535);
 	check_bit_exact(96000, 32000);
+	check_unity_capacity();
 	puts("hc15xx resampler tests: PASS");
 	return 0;
 }

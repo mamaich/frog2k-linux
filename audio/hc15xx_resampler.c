@@ -103,6 +103,25 @@ size_t hc15xx_resampler_process_stereo_s16(struct hc15xx_resampler *state,
 		return 0;
 	input_rate = state->input_rate;
 	output_rate = state->output_rate;
+	/*
+	 * The native qpsx path runs both sides at 44.1 kHz.  In that case the
+	 * generic phase/interpolation loop can only reproduce the current mono
+	 * sample, but still pays for phase bookkeeping and an integer divide per
+	 * frame on a CPU without hardware division.  Keep the exact generic path
+	 * for rate changes and non-zero carried phases.
+	 */
+	if (input_rate == output_rate && state->phase == 0) {
+		size_t count = frames < capacity ? frames : capacity;
+
+		for (input = 0; input < count; ++input)
+			mono[input] = (int16_t)(((int32_t)stereo[input * 2] +
+				(int32_t)stereo[input * 2 + 1]) / 2);
+		if (count) {
+			state->previous = mono[count - 1];
+			state->have_previous = 1;
+		}
+		return count;
+	}
 	if (input_rate > UINT16_MAX || output_rate > UINT16_MAX)
 		return process_wide_rates(state, stereo, frames, mono, capacity);
 	phase = state->phase;
