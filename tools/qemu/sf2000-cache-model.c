@@ -468,6 +468,8 @@ static void write_report(const char *kind)
     uint64_t d_miss_ppm;
     uint64_t rec_i_ppm;
     uint64_t rec_d_ppm;
+    uint64_t rec_i_miss_ppm;
+    uint64_t rec_d_miss_ppm;
     uint64_t delta_instructions;
     uint64_t delta_i_misses;
     uint64_t delta_d_misses;
@@ -482,6 +484,8 @@ static void write_report(const char *kind)
     d_miss_ppm = ratio_ppm(model.d_misses, model.d_lines);
     rec_i_ppm = ratio_ppm(model.rec_i_accesses, model.i_accesses);
     rec_d_ppm = ratio_ppm(model.rec_d_accesses, model.d_accesses);
+    rec_i_miss_ppm = ratio_ppm(model.rec_i_misses, model.rec_i_accesses);
+    rec_d_miss_ppm = ratio_ppm(model.rec_d_misses, model.rec_d_accesses);
     if (model.have_previous) {
         delta_instructions = model.instructions - model.previous_instructions;
         delta_i_misses = model.i_misses - model.previous_i_misses;
@@ -499,6 +503,7 @@ static void write_report(const char *kind)
             " d_misses=%" PRIu64 " stores=%" PRIu64 " mmio=%" PRIu64
             " i_miss_ppm=%" PRIu64 " d_miss_ppm=%" PRIu64
             " rec_i_ppm=%" PRIu64 " rec_d_ppm=%" PRIu64
+            " rec_i_miss_ppm=%" PRIu64 " rec_d_miss_ppm=%" PRIu64
             " branches=%" PRIu64 " jumps=%" PRIu64
             " loads=%" PRIu64 " store_insns=%" PRIu64
             " muldiv=%" PRIu64 " cop2=%" PRIu64
@@ -510,6 +515,7 @@ static void write_report(const char *kind)
             model.i_accesses, model.i_misses, model.d_accesses,
             model.d_lines, model.d_misses, model.stores, model.mmio,
             i_miss_ppm, d_miss_ppm, rec_i_ppm, rec_d_ppm,
+            rec_i_miss_ppm, rec_d_miss_ppm,
             model.insn_classes[INSN_BRANCH], model.insn_classes[INSN_JUMP],
             model.insn_classes[INSN_LOAD], model.insn_classes[INSN_STORE],
             model.insn_classes[INSN_MULDIV], model.insn_classes[INSN_COP2],
