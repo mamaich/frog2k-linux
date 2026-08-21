@@ -550,6 +550,14 @@ QEMU_CACHE_MODEL_RECBASE ?= auto
 QEMU_CACHE_MODEL_RECSIZE ?= 0x880000
 QEMU_CACHE_MODEL_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-model.log
 QEMU_CACHE_MODEL_HOT_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-hotspots.log
+# GTE body/entry diagnostics are opt-in because the ranges must come from the
+# exact ELF under test.  The plugin verifies the map's core layout and SHA-256
+# against QEMU's coreelf= argument before installing the callbacks.
+QEMU_CACHE_MODEL_GTE_MAP ?=
+QEMU_CACHE_MODEL_GTE_ELF ?= $(QPSX_TEST_CORE)
+QEMU_CACHE_MODEL_GTE_LD_MAP ?=
+QEMU_PLUGIN_COMMA := ,
+QEMU_CACHE_MODEL_GTE_PLUGIN_ARGS = $(if $(strip $(QEMU_CACHE_MODEL_GTE_MAP)),$(QEMU_PLUGIN_COMMA)gtemap=$(QEMU_CACHE_MODEL_GTE_MAP)$(QEMU_PLUGIN_COMMA)coreelf=$(QEMU_CACHE_MODEL_GTE_ELF),)
 QEMU_CACHE_COMPARE_LOGS ?=
 QEMU_CACHE_COMPARE_START_FRAME ?= 900
 GE_VENDOR_ARCHIVE ?= $(HCRTOS_SDK_DIR)/lib/vendor/libge.a
@@ -624,6 +632,7 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
 	benchmark-linux-qpsx-attract-dev \
 	benchmark-linux-qpsx-cache-model-fast \
+	qemu-cache-gte-map \
 	qpsx-cache-oracle-compare \
 	qpsx-no-menu-physical \
 	gpsp-smc-test-roms run-linux-gpsp-smc smoke-linux-gpsp-smc \
@@ -3400,6 +3409,66 @@ QEMU_GE_PROFILE ?= 0
 QEMU_CACHE_MODEL_ASD_TARGET ?= linux-full-test-asd
 QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
 
+# Generate the explicit GTE map from the exact link map and ELF used by one
+# QEMU run.  Keep this opt-in and refuse to overwrite an existing output: a
+# control/candidate pair must carry distinct, verifiable maps.  The linker
+# map contains the specialized INTPL entry points as separate ranges; awk
+# emits each of them with the common architectural operation name.
+qemu-cache-gte-map:
+	@test -n '$(strip $(QEMU_CACHE_MODEL_GTE_LD_MAP))' || { \
+		echo 'set QEMU_CACHE_MODEL_GTE_LD_MAP to the exact linker map' >&2; exit 2; }
+	@test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))' || { \
+		echo 'set a unique QEMU_CACHE_MODEL_GTE_MAP output path' >&2; exit 2; }
+	@test -s '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'
+	@test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'
+	@test ! -e '$(QEMU_CACHE_MODEL_GTE_MAP)' || { \
+		echo 'refusing to overwrite existing GTE map; choose a new path' >&2; exit 2; }
+	mkdir -p '$(dir $(QEMU_CACHE_MODEL_GTE_MAP))'
+	core_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+	{ \
+		printf '# sf2000-gte-map version=1 corebase=%s coresize=%s core_sha256=%s\n' \
+			'$(QEMU_CACHE_MODEL_COREBASE)' '$(QEMU_CACHE_MODEL_CORESIZE)' "$$core_sha"; \
+		awk ' \
+			function wanted(n) { \
+				return n == "gteRTPS" || n == "gteRTPT" || \
+					n == "gteMVMVA" || n == "gteNCLIP" || \
+					n == "gteAVSZ3" || n == "gteAVSZ4" || \
+					n == "gteSQR" || n == "gteNCCS" || \
+					n == "gteNCCT" || n == "gteNCDS" || \
+					n == "gteNCDT" || n == "gteOP" || \
+					n == "gteDCPL" || n == "gteGPF" || \
+					n == "gteGPL" || n == "gteDPCS" || \
+					n == "gteDPCT" || n == "gteNCS" || \
+					n == "gteNCT" || n == "gteCC" || \
+					n == "gteINTPL" || n ~ /^gteINTPL_/ || \
+					n == "gteCDP" \
+			} \
+			function normalized(n) { \
+				n = tolower(n); sub(/^gte/, "", n); return n \
+			} \
+			function work(n) { \
+				return n == "gteRTPT" || n == "gteNCCT" || \
+					n == "gteNCDT" || n == "gteDPCT" || n == "gteNCT" ? 3 : 1 \
+			} \
+			/gte\.o/ && $$1 ~ /^0x/ && $$2 ~ /^0x/ { \
+				address = $$1; function_size = $$2; pending = 1; next \
+			} \
+			/gte\.o/ && $$2 ~ /^0x/ && $$3 ~ /^0x/ { \
+				address = $$2; function_size = $$3; pending = 1; next \
+			} \
+			pending { \
+				name = $$2; sub(/\(.*/, "", name); \
+				if (wanted(name)) print "gte " normalized(name) " " address " " function_size " " work(name); \
+				pending = 0 \
+			}' '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'; \
+	} > '$(QEMU_CACHE_MODEL_GTE_MAP)'
+	for operation in rtps rtpt mvmva nclip avsz3 avsz4 sqr nccs ncct ncds ncdt op dcpl gpf gpl dpcs dpct ncs nct cc intpl cdp; do \
+		grep -q "^gte $$operation " '$(QEMU_CACHE_MODEL_GTE_MAP)' || { \
+			echo "GTE link map is missing $$operation" >&2; exit 2; }; \
+	done
+	@test "$$(grep -c '^gte ' '$(QEMU_CACHE_MODEL_GTE_MAP)')" -ge 22
+	@echo "wrote $(QEMU_CACHE_MODEL_GTE_MAP) for $(QEMU_CACHE_MODEL_GTE_ELF)"
+
 # Run the same no-input Ridge Racer attract workload with the diagnostic
 # plugin.  The plugin's output is cumulative and periodically flushed, so the
 # final sample remains available even when the monitor sends `quit` before
@@ -3419,6 +3488,12 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
 	: > '$(QEMU_CACHE_MODEL_LOG)'
 	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		test -s '$(QEMU_CACHE_MODEL_GTE_MAP)'; test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'; \
+		elf_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+		sd_sha=$$(mtype -i '$(QPSX_REAL_TEST_SD)' ::/sf2000/cores/sf2000-qpsx | sha256sum | awk '{print $$1}'); \
+		test "$$elf_sha" = "$$sd_sha" || { echo 'GTE map ELF is not the core in the QEMU SD image' >&2; exit 2; }; \
+	fi
 	$(MAKE) run-linux-qpsx-attract-benchmark \
 		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' \
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
@@ -3428,7 +3503,7 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
 		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)$(QEMU_CACHE_MODEL_GTE_PLUGIN_ARGS)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
@@ -3446,6 +3521,12 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	# correctness checks; requiring the racy third line rejects complete runs.
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
+	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		grep -Eq '^gte .*map_status=ok .*entries=[1-9][0-9]* ' \
+			'$(QEMU_CACHE_MODEL_LOG)' || { \
+			echo 'GTE oracle map produced no executed entry points' >&2; exit 2; \
+		}; \
+	fi
 	@tail -n 5 '$(QEMU_CACHE_MODEL_LOG)'
 	@test -s '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	@sed -n '1,12p' '$(QEMU_CACHE_MODEL_HOT_LOG)'
@@ -3456,6 +3537,12 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	test -s '$(BUILD_DIR)/sf2000-linux-full.asd'
 	test -s '$(QPSX_REAL_TEST_SD)'
+	if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		test -s '$(QEMU_CACHE_MODEL_GTE_MAP)'; test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'; \
+		elf_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+		sd_sha=$$(mtype -i '$(QPSX_REAL_TEST_SD)' ::/sf2000/cores/sf2000-qpsx | sha256sum | awk '{print $$1}'); \
+		test "$$elf_sha" = "$$sd_sha" || { echo 'GTE map ELF is not the core in the QEMU SD image' >&2; exit 2; }; \
+	fi
 	$(if $(and $(filter-out 0,$(QEMU_CACHE_MODEL_FRAMES)),$(filter 1,$(QPSX_BENCHMARK_REBUILD_ASD))),\
 	$(MAKE) --no-print-directory ROOTFS=full SDCARD_ASD_SYNC=0 \
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
@@ -3473,7 +3560,7 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
 		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)$(QEMU_CACHE_MODEL_GTE_PLUGIN_ARGS)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
@@ -3487,6 +3574,12 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
+	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		grep -Eq '^gte .*map_status=ok .*entries=[1-9][0-9]* ' \
+			'$(QEMU_CACHE_MODEL_LOG)' || { \
+			echo 'GTE oracle map produced no executed entry points' >&2; exit 2; \
+		}; \
+	fi
 	@tail -n 3 '$(QEMU_CACHE_MODEL_LOG)'
 
 # Compare exact-frame oracle logs in one stable table. The first file is the

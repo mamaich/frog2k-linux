@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <qemu-plugin.h>
 
@@ -56,9 +57,93 @@ enum InsnClass {
     INSN_CLASS_COUNT
 };
 
+/* The QPSX static GTE implementation is one of the few large, repeatedly
+ * entered helper islands in the core text.  COP2 is not visible to this
+ * plugin: the dynarec calls these C functions directly, so the guest COP2
+ * opcode counter is zero even though the GTE is busy.
+ *
+ * The entries are populated only by an explicit gtemap= file.  In particular,
+ * do not put linker addresses in this source: a GTE specialization changes
+ * the complete downstream layout and would otherwise make the oracle count
+ * unrelated code while appearing healthy.  The map header records the exact
+ * core base/size and a SHA-256 of coreelf=; installation rejects a mismatch.
+ * This is intentionally a diagnostic map, not a guessed replacement for the
+ * target's cycle counter.
+ */
+enum GteOp {
+    GTE_RTPS,
+    GTE_RTPT,
+    GTE_MVMVA,
+    GTE_NCLIP,
+    GTE_AVSZ3,
+    GTE_AVSZ4,
+    GTE_SQR,
+    GTE_NCCS,
+    GTE_NCCT,
+    GTE_NCDS,
+    GTE_NCDT,
+    GTE_OP,
+    GTE_DCPL,
+    GTE_GPF,
+    GTE_GPL,
+    GTE_DPCS,
+    GTE_DPCT,
+    GTE_NCS,
+    GTE_NCT,
+    GTE_CC,
+    GTE_INTPL,
+    GTE_CDP,
+    GTE_OP_COUNT
+};
+
+typedef struct {
+    uint32_t offset;
+    uint32_t size;
+    unsigned char work;
+    const char *name;
+} GteSite;
+
+typedef struct {
+    uint32_t offset;
+    uint32_t size;
+    unsigned char operation;
+    unsigned char work;
+} GteRange;
+
+/* Work is a relative operation-unit metric.  RTPT/NCCT/NCDT/NCT/DPCT are
+ * three-vector operations; the remaining weights deliberately stay at one.
+ * Do not add this uncalibrated quantity to est_cycles: static instructions
+ * and cache costs already account for their actual emitted code. */
+static const GteSite gte_operations[GTE_OP_COUNT] = {
+    { 0, 0, 1, "rtps" }, { 0, 0, 3, "rtpt" },
+    { 0, 0, 1, "mvmva" }, { 0, 0, 1, "nclip" },
+    { 0, 0, 1, "avsz3" }, { 0, 0, 1, "avsz4" },
+    { 0, 0, 1, "sqr" }, { 0, 0, 1, "nccs" },
+    { 0, 0, 3, "ncct" }, { 0, 0, 1, "ncds" },
+    { 0, 0, 3, "ncdt" }, { 0, 0, 1, "op" },
+    { 0, 0, 1, "dcpl" }, { 0, 0, 1, "gpf" },
+    { 0, 0, 1, "gpl" }, { 0, 0, 1, "dpcs" },
+    { 0, 0, 3, "dpct" }, { 0, 0, 1, "ncs" },
+    { 0, 0, 3, "nct" }, { 0, 0, 1, "cc" },
+    { 0, 0, 1, "intpl" }, { 0, 0, 1, "cdp" }
+};
+
+#define GTE_MAX_RANGES 127
+static GteRange gte_ranges[GTE_MAX_RANGES];
+static size_t gte_range_count;
+
+/* Zero means no GTE body; the low seven bits otherwise contain op + 1.  The
+ * high bit marks an exact function entry, allowing one byte per TB instruction
+ * to represent both call counts and body instruction/cache costs.  The low
+ * bits identify a range (not an operation), so multiple specialized ranges
+ * can aggregate into one architectural operation. */
+#define GTE_ID_NONE 0
+#define GTE_ID_ENTRY 0x80
+
 typedef struct {
     uint64_t *pc;
     unsigned char *class_id;
+    unsigned char *gte_id;
     HotspotEntry **hot;
     size_t count;
     size_t rec_count;
@@ -67,6 +152,7 @@ typedef struct {
 typedef struct {
     HotspotEntry *hot;
     uint64_t pc;
+    unsigned char gte_id;
 } MemData;
 
 typedef struct {
@@ -101,6 +187,20 @@ typedef struct {
     uint64_t core_base;
     uint64_t core_end;
     int rec_base_auto;
+    int gte_enabled;
+    uint64_t gte_map_hits;
+    uint64_t gte_entries;
+    uint64_t gte_map_entries;
+    char gte_map_path[PATH_MAX];
+    char gte_core_elf[PATH_MAX];
+    char gte_core_sha256[65];
+    uint64_t gte_instructions;
+    uint64_t gte_i_misses;
+    uint64_t gte_d_accesses;
+    uint64_t gte_d_lines;
+    uint64_t gte_d_misses;
+    uint64_t gte_counts[GTE_OP_COUNT];
+    uint64_t gte_work;
     int core_only;
     int emu_only;
     uint64_t rec_i_accesses;
@@ -129,6 +229,9 @@ typedef struct {
     uint64_t frame_previous_cycles;
     uint64_t frame_cycle_sum;
     uint64_t frame_cycle_values[4096];
+    uint64_t frame_gte_work_sum;
+    uint64_t frame_gte_work_values[4096];
+    uint64_t frame_previous_gte_work;
     size_t frame_cycle_count;
     int frame_have_previous;
     int frame_frozen;
@@ -213,6 +316,32 @@ static int pc_is_core_code(uint64_t pc)
     return pc >= model.core_base && pc < model.core_end;
 }
 
+static unsigned char gte_id_for_pc(uint64_t pc)
+{
+    uint64_t offset;
+    size_t index;
+
+    if (!model.gte_enabled || !pc_is_core_code(pc) ||
+        pc < model.core_base) {
+        return GTE_ID_NONE;
+    }
+    offset = pc - model.core_base;
+    for (index = 0; index < gte_range_count; index++) {
+        const GteRange *range = &gte_ranges[index];
+
+        if (offset >= range->offset &&
+            offset < (uint64_t)range->offset + range->size) {
+            unsigned char id = (unsigned char)(index + 1);
+
+            if (offset == range->offset) {
+                id |= GTE_ID_ENTRY;
+            }
+            return id;
+        }
+    }
+    return GTE_ID_NONE;
+}
+
 static int pc_is_selected(uint64_t pc)
 {
     if (model.emu_only) {
@@ -250,6 +379,20 @@ static const char *coverage_label(void)
         return "full";
     }
     return model.rec_only ? "rec-only" : "post-rec-late";
+}
+
+static const char *gte_map_status(void)
+{
+    if (!model.gte_enabled) {
+        return "disabled";
+    }
+    if (!model.gte_map_hits) {
+        return "zero-hit";
+    }
+    if (!model.gte_entries) {
+        return "body-only";
+    }
+    return "ok";
 }
 
 /* Keep a compact footprint of generated-code instruction lines.  The target
@@ -493,6 +636,15 @@ static void reset_measurement(void)
     model.previous_estimated_cycles = 0;
     model.have_previous = 0;
     memset(model.insn_classes, 0, sizeof(model.insn_classes));
+    model.gte_instructions = 0;
+    model.gte_i_misses = 0;
+    model.gte_d_accesses = 0;
+    model.gte_d_lines = 0;
+    model.gte_d_misses = 0;
+    memset(model.gte_counts, 0, sizeof(model.gte_counts));
+    model.gte_work = 0;
+    model.gte_map_hits = 0;
+    model.gte_entries = 0;
     model.rec_i_accesses = 0;
     model.rec_i_misses = 0;
     model.rec_d_accesses = 0;
@@ -512,6 +664,8 @@ static void reset_measurement(void)
     model.frame_previous_cycles = 0;
     model.frame_cycle_sum = 0;
     model.frame_cycle_count = 0;
+    model.frame_gte_work_sum = 0;
+    model.frame_previous_gte_work = 0;
     model.frame_have_previous = 0;
     clear_hotspot_counts();
 }
@@ -527,6 +681,205 @@ static uint64_t parse_u64(const char *text, uint64_t fallback)
         return fallback;
     }
     return (uint64_t)value;
+}
+
+/* A GTE map is generated beside the exact QPSX ELF by the build workflow.
+ * Verify its fingerprint here as well as in the Makefile so a manually
+ * invoked QEMU run cannot silently profile a different core.  sha256sum is a
+ * normal host utility already required by this repository's build/tests; it
+ * is run once at plugin installation, never in the emulation hot path. */
+static int verify_file_sha256(const char *path, const char *expected)
+{
+    char command[PATH_MAX + 32];
+    char line[256];
+    FILE *pipe;
+    int status;
+
+    /* The path comes from QEMU_PLUGIN_ARGS.  Refuse shell metacharacters
+     * rather than turning a diagnostic option into command execution. */
+    if (!path[0] || strchr(path, '\'') || strchr(path, '\n') ||
+        strchr(path, '\r') ||
+        snprintf(command, sizeof(command), "/usr/bin/sha256sum '%s'", path)
+            >= (int)sizeof(command)) {
+        return -1;
+    }
+    pipe = popen(command, "r");
+    if (!pipe || !fgets(line, sizeof(line), pipe)) {
+        if (pipe) {
+            pclose(pipe);
+        }
+        return -1;
+    }
+    status = pclose(pipe);
+    if (status != 0 || strlen(line) < 64) {
+        return -1;
+    }
+    line[64] = '\0';
+    return strcasecmp(line, expected) == 0 ? 0 : -1;
+}
+
+static int gte_site_index(const char *name)
+{
+    size_t index;
+
+    for (index = 0; index < GTE_OP_COUNT; index++) {
+        if (strcmp(name, gte_operations[index].name) == 0) {
+            return (int)index;
+        }
+    }
+    /* Optimized GTE builds may split one architectural command into several
+     * entry points (for example gteINTPL_LM_*).  The operation histogram must
+     * aggregate those entry points rather than dropping them. */
+    if (strncmp(name, "intpl_", 6) == 0) {
+        return GTE_INTPL;
+    }
+    return -1;
+}
+
+/* Load a map in the intentionally boring, reviewable format:
+ *
+ *   # sf2000-gte-map version=1 corebase=0x83000000 coresize=0x120000 \
+ *       core_sha256=<sha256 of exact ELF>
+ *   gte rtps 0x54448 0x7c8 1
+ *   ...
+ *
+ * Addresses are offsets from corebase, and the final column is only a
+ * relative work-unit weight for comparing scenes.  Every architectural
+ * operation must appear at least once; several ranges may map to one
+ * operation (the specialized INTPL entry points are the usual example).
+ * Ranges must be inside the core and non-overlapping. */
+static int load_gte_map(const char *path)
+{
+    FILE *map;
+    char line[256];
+    char base_text[32];
+    char size_text[32];
+    char hash_text[65];
+    uint64_t map_base;
+    uint64_t map_size;
+    unsigned char seen[GTE_OP_COUNT] = { 0 };
+    size_t index;
+    int have_header = 0;
+
+    gte_range_count = 0;
+    memset(gte_ranges, 0, sizeof(gte_ranges));
+    map = fopen(path, "r");
+    if (!map) {
+        fprintf(stderr, "sf2000-cache-model: cannot open gtemap %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    memset(hash_text, 0, sizeof(hash_text));
+    while (fgets(line, sizeof(line), map)) {
+        char name[32];
+        char offset_text[32];
+        char function_size_text[32];
+        char work_text[32];
+        int operation;
+        uint64_t offset;
+        uint64_t function_size;
+        uint64_t work;
+
+        if (line[0] == '#') {
+            if (sscanf(line,
+                       "# sf2000-gte-map version=1 corebase=%31s "
+                       "coresize=%31s core_sha256=%64s",
+                       base_text, size_text, hash_text) == 3) {
+                map_base = parse_u64(base_text, UINT64_MAX);
+                map_size = parse_u64(size_text, UINT64_MAX);
+                if (map_base == UINT64_MAX || map_size == UINT64_MAX ||
+                    strlen(hash_text) != 64) {
+                    fprintf(stderr,
+                            "sf2000-cache-model: malformed gtemap header\n");
+                    fclose(map);
+                    return -1;
+                }
+                have_header = 1;
+            }
+            continue;
+        }
+        if (sscanf(line, "gte %31s %31s %31s %31s", name, offset_text,
+                   function_size_text, work_text) != 4) {
+            continue;
+        }
+        operation = gte_site_index(name);
+        offset = parse_u64(offset_text, UINT64_MAX);
+        function_size = parse_u64(function_size_text, UINT64_MAX);
+        work = parse_u64(work_text, UINT64_MAX);
+        if (operation < 0 || offset == UINT64_MAX ||
+            function_size == UINT64_MAX || function_size == 0 || work == 0 ||
+            work > UCHAR_MAX || offset > UINT32_MAX ||
+            function_size > UINT32_MAX || offset > UINT64_MAX - function_size ||
+            gte_range_count >= GTE_MAX_RANGES) {
+            fprintf(stderr, "sf2000-cache-model: invalid gtemap entry: %s",
+                    line);
+            fclose(map);
+            return -1;
+        }
+        gte_ranges[gte_range_count].offset = (uint32_t)offset;
+        gte_ranges[gte_range_count].size = (uint32_t)function_size;
+        gte_ranges[gte_range_count].operation = (unsigned char)operation;
+        gte_ranges[gte_range_count].work = (unsigned char)work;
+        gte_range_count++;
+        seen[operation] = 1;
+    }
+    fclose(map);
+    if (!have_header || map_base != model.core_base ||
+        map_size != model.core_end - model.core_base || !hash_text[0]) {
+        fprintf(stderr,
+                "sf2000-cache-model: gtemap core layout/fingerprint header "
+                "does not match corebase=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+                model.core_base, model.core_end - model.core_base);
+        return -1;
+    }
+    if (!model.gte_core_sha256[0]) {
+        snprintf(model.gte_core_sha256, sizeof(model.gte_core_sha256),
+                 "%s", hash_text);
+    } else if (strcasecmp(model.gte_core_sha256, hash_text) != 0) {
+        fprintf(stderr, "sf2000-cache-model: gtemap/coreelf hash mismatch\n");
+        return -1;
+    }
+    if (!model.gte_core_elf[0] ||
+        verify_file_sha256(model.gte_core_elf, model.gte_core_sha256) != 0) {
+        fprintf(stderr,
+                "sf2000-cache-model: gtemap requires matching coreelf=\n");
+        return -1;
+    }
+    for (index = 0; index < GTE_OP_COUNT; index++) {
+        if (!seen[index]) {
+            fprintf(stderr,
+                    "sf2000-cache-model: gtemap is missing %s\n",
+                    gte_operations[index].name);
+            return -1;
+        }
+    }
+    for (index = 0; index < gte_range_count; index++) {
+        size_t prior;
+
+        if (gte_ranges[index].offset > model.core_end - model.core_base ||
+            gte_ranges[index].size > model.core_end - model.core_base -
+                                      gte_ranges[index].offset) {
+            fprintf(stderr,
+                    "sf2000-cache-model: gtemap range outside core\n");
+            return -1;
+        }
+        for (prior = 0; prior < index; prior++) {
+            uint64_t left_end = (uint64_t)gte_ranges[prior].offset +
+                                gte_ranges[prior].size;
+
+            if (gte_ranges[index].offset < left_end &&
+                gte_ranges[prior].offset <
+                (uint64_t)gte_ranges[index].offset +
+                gte_ranges[index].size) {
+                fprintf(stderr,
+                        "sf2000-cache-model: overlapping gtemap entries\n");
+                return -1;
+            }
+        }
+    }
+    model.gte_map_entries = gte_range_count;
+    model.gte_enabled = 1;
+    return 0;
 }
 
 static HotspotEntry *hotspot_lookup(uint64_t pc)
@@ -575,21 +928,28 @@ static int compare_u64(const void *left, const void *right)
     return a < b ? -1 : a > b;
 }
 
-static uint64_t frame_percentile(unsigned int permille)
+static uint64_t array_percentile(const uint64_t *values, size_t count,
+                                 unsigned int permille)
 {
     uint64_t rank;
 
-    if (model.frame_cycle_count == 0) {
+    if (count == 0) {
         return 0;
     }
-    rank = ((uint64_t)model.frame_cycle_count * permille + 999) / 1000;
+    rank = ((uint64_t)count * permille + 999) / 1000;
     if (rank == 0) {
         rank = 1;
     }
-    if (rank > model.frame_cycle_count) {
-        rank = model.frame_cycle_count;
+    if (rank > count) {
+        rank = count;
     }
-    return model.frame_cycle_values[rank - 1];
+    return values[rank - 1];
+}
+
+static uint64_t frame_percentile(unsigned int permille)
+{
+    return array_percentile(model.frame_cycle_values,
+                            model.frame_cycle_count, permille);
 }
 
 static void clear_hotspot_counts(void)
@@ -651,7 +1011,7 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=12 sample=%" PRIu64
+            "# sf2000-cache-model hotspots version=13 sample=%" PRIu64
             " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
             " frame=%" PRIu64 " label=%s\n",
             model.sample_no, kind, model.instructions,
@@ -708,6 +1068,12 @@ static void write_report(const char *kind)
     uint64_t frame_p99_cycles;
     uint64_t frame_p999_cycles;
     uint64_t frame_max_cycles;
+    uint64_t frame_gte_work_average;
+    uint64_t frame_gte_work_p95;
+    uint64_t frame_gte_work_p98;
+    uint64_t frame_gte_work_p99;
+    uint64_t frame_gte_work_p999;
+    uint64_t frame_gte_work_max;
     uint64_t helper_i_accesses;
     uint64_t helper_i_misses;
     uint64_t helper_d_accesses;
@@ -726,12 +1092,26 @@ static void write_report(const char *kind)
     if (model.frame_cycle_count) {
         qsort(model.frame_cycle_values, model.frame_cycle_count,
               sizeof(model.frame_cycle_values[0]), compare_u64);
+        qsort(model.frame_gte_work_values, model.frame_cycle_count,
+              sizeof(model.frame_gte_work_values[0]), compare_u64);
     }
     frame_p95_cycles = frame_percentile(950);
     frame_p98_cycles = frame_percentile(980);
     frame_p99_cycles = frame_percentile(990);
     frame_p999_cycles = frame_percentile(999);
     frame_max_cycles = frame_percentile(1000);
+    frame_gte_work_average = model.frame_cycle_count ?
+        model.frame_gte_work_sum / model.frame_cycle_count : 0;
+    frame_gte_work_p95 = array_percentile(model.frame_gte_work_values,
+                                           model.frame_cycle_count, 950);
+    frame_gte_work_p98 = array_percentile(model.frame_gte_work_values,
+                                           model.frame_cycle_count, 980);
+    frame_gte_work_p99 = array_percentile(model.frame_gte_work_values,
+                                           model.frame_cycle_count, 990);
+    frame_gte_work_p999 = array_percentile(model.frame_gte_work_values,
+                                            model.frame_cycle_count, 999);
+    frame_gte_work_max = array_percentile(model.frame_gte_work_values,
+                                           model.frame_cycle_count, 1000);
     i_miss_ppm = ratio_ppm(model.i_misses, model.i_accesses);
     d_miss_ppm = ratio_ppm(model.d_misses, model.d_lines);
     rec_i_ppm = ratio_ppm(model.rec_i_accesses, model.i_accesses);
@@ -790,6 +1170,20 @@ static void write_report(const char *kind)
             " frame_p99_cycles=%" PRIu64
             " frame_p999_cycles=%" PRIu64
             " frame_max_cycles=%" PRIu64
+            " gte_instructions=%" PRIu64
+            " gte_i_misses=%" PRIu64
+            " gte_d_accesses=%" PRIu64
+            " gte_d_lines=%" PRIu64
+            " gte_d_misses=%" PRIu64
+            " gte_work=%" PRIu64
+            " frame_gte_work_avg=%" PRIu64
+            " frame_gte_work_p95=%" PRIu64
+            " frame_gte_work_p98=%" PRIu64
+            " frame_gte_work_p99=%" PRIu64
+            " frame_gte_work_p999=%" PRIu64
+            " frame_gte_work_max=%" PRIu64
+            " gte_map_enabled=%d gte_map_entries=%" PRIu64
+            " gte_map_hits=%" PRIu64 " gte_entries=%" PRIu64
             " i_accesses=%" PRIu64 " i_misses=%" PRIu64
             " i_invalidations=%" PRIu64
             " d_accesses=%" PRIu64 " d_lines=%" PRIu64
@@ -841,6 +1235,12 @@ static void write_report(const char *kind)
             model.frame_number, model.frame_cycle_count,
             frame_average_cycles, frame_p95_cycles, frame_p98_cycles,
             frame_p99_cycles, frame_p999_cycles, frame_max_cycles,
+            model.gte_instructions, model.gte_i_misses,
+            model.gte_d_accesses, model.gte_d_lines, model.gte_d_misses,
+            model.gte_work, frame_gte_work_average, frame_gte_work_p95,
+            frame_gte_work_p98, frame_gte_work_p99, frame_gte_work_p999,
+            frame_gte_work_max, model.gte_enabled, model.gte_map_entries,
+            model.gte_map_hits, model.gte_entries,
             model.i_accesses, model.i_misses, model.i_invalidations,
             model.d_accesses,
             model.d_lines, model.d_bytes, model.d_size_counts[0],
@@ -884,6 +1284,49 @@ static void write_report(const char *kind)
             ratio_ppm(helper_d_misses, model.d_misses),
             estimated_cycles, delta_instructions, delta_i_misses,
             delta_d_misses, delta_estimated_cycles);
+    fprintf(model.out,
+            "gte sample=%" PRIu64 " kind=%s label=%s frame=%" PRIu64
+            " frame_samples=%zu base=0x%016" PRIx64
+            " map_enabled=%d map_entries=%" PRIu64
+            " map_hits=%" PRIu64 " entries=%" PRIu64
+            " map_status=%s"
+            " rtps=%" PRIu64 " rtpt=%" PRIu64
+            " mvmva=%" PRIu64 " nclip=%" PRIu64
+            " avsz3=%" PRIu64 " avsz4=%" PRIu64
+            " sqr=%" PRIu64 " nccs=%" PRIu64
+            " ncct=%" PRIu64 " ncds=%" PRIu64
+            " ncdt=%" PRIu64 " op=%" PRIu64
+            " dcpl=%" PRIu64 " gpf=%" PRIu64
+            " gpl=%" PRIu64 " dpcs=%" PRIu64
+            " dpct=%" PRIu64 " ncs=%" PRIu64
+            " nct=%" PRIu64 " cc=%" PRIu64
+            " intpl=%" PRIu64 " cdp=%" PRIu64
+            " instructions=%" PRIu64 " i_misses=%" PRIu64
+            " d_accesses=%" PRIu64 " d_lines=%" PRIu64
+            " d_misses=%" PRIu64 " work=%" PRIu64
+            " frame_work_avg=%" PRIu64 " frame_work_p95=%" PRIu64
+            " frame_work_p98=%" PRIu64 " frame_work_p99=%" PRIu64
+            " frame_work_p999=%" PRIu64 " frame_work_max=%" PRIu64 "\n",
+            model.sample_no, kind, model.label, model.frame_number,
+            model.frame_cycle_count, model.core_base, model.gte_enabled,
+            model.gte_map_entries, model.gte_map_hits, model.gte_entries,
+            gte_map_status(),
+            model.gte_counts[GTE_RTPS], model.gte_counts[GTE_RTPT],
+            model.gte_counts[GTE_MVMVA], model.gte_counts[GTE_NCLIP],
+            model.gte_counts[GTE_AVSZ3], model.gte_counts[GTE_AVSZ4],
+            model.gte_counts[GTE_SQR], model.gte_counts[GTE_NCCS],
+            model.gte_counts[GTE_NCCT], model.gte_counts[GTE_NCDS],
+            model.gte_counts[GTE_NCDT], model.gte_counts[GTE_OP],
+            model.gte_counts[GTE_DCPL], model.gte_counts[GTE_GPF],
+            model.gte_counts[GTE_GPL], model.gte_counts[GTE_DPCS],
+            model.gte_counts[GTE_DPCT], model.gte_counts[GTE_NCS],
+            model.gte_counts[GTE_NCT], model.gte_counts[GTE_CC],
+            model.gte_counts[GTE_INTPL], model.gte_counts[GTE_CDP],
+            model.gte_instructions, model.gte_i_misses,
+            model.gte_d_accesses, model.gte_d_lines, model.gte_d_misses,
+            model.gte_work, frame_gte_work_average, frame_gte_work_p95,
+            frame_gte_work_p98, frame_gte_work_p99, frame_gte_work_p999,
+            frame_gte_work_max);
     fflush(model.out);
     model.previous_instructions = model.instructions;
     model.previous_i_misses = model.i_misses;
@@ -909,6 +1352,7 @@ static void frame_marker_exec(unsigned int vcpu_index, void *userdata)
 {
     uint64_t cycles;
     uint64_t frame_cycles;
+    uint64_t frame_gte_work;
     int report_now;
 
     (void)vcpu_index;
@@ -921,6 +1365,7 @@ static void frame_marker_exec(unsigned int vcpu_index, void *userdata)
         return;
     }
     cycles = estimated_cycles_now();
+    frame_gte_work = model.gte_work - model.frame_previous_gte_work;
     if (model.frame_have_previous) {
         frame_cycles = cycles - model.frame_previous_cycles;
         if (model.frame_cycle_count <
@@ -928,9 +1373,13 @@ static void frame_marker_exec(unsigned int vcpu_index, void *userdata)
             sizeof(model.frame_cycle_values[0])) {
             model.frame_cycle_values[model.frame_cycle_count++] = frame_cycles;
             model.frame_cycle_sum += frame_cycles;
+            model.frame_gte_work_values[model.frame_cycle_count - 1] =
+                frame_gte_work;
+            model.frame_gte_work_sum += frame_gte_work;
         }
     }
     model.frame_previous_cycles = cycles;
+    model.frame_previous_gte_work = model.gte_work;
     model.frame_have_previous = 1;
 
     report_now = model.frame_report_period &&
@@ -941,6 +1390,7 @@ static void frame_marker_exec(unsigned int vcpu_index, void *userdata)
     if (report_now) {
         write_report("frame");
         model.frame_cycle_sum = 0;
+        model.frame_gte_work_sum = 0;
         model.frame_cycle_count = 0;
         clear_hotspot_counts();
     }
@@ -971,6 +1421,8 @@ static void tb_exec(unsigned int vcpu_index, void *userdata)
         model.phase_active = 1;
     }
     for (index = 0; index < tb->count; index++) {
+        unsigned char gte_id = GTE_ID_NONE;
+
         if (!pc_is_selected(tb->pc[index])) {
             continue;
         }
@@ -983,11 +1435,29 @@ static void tb_exec(unsigned int vcpu_index, void *userdata)
             rec_tb_seen = 1;
             rec_code_observe(tb->pc[index]);
         }
+        if (tb->gte_id) {
+            gte_id = tb->gte_id[index];
+        }
+        if (gte_id != GTE_ID_NONE) {
+            unsigned int range = (gte_id & ~GTE_ID_ENTRY) - 1;
+            unsigned int operation = gte_ranges[range].operation;
+
+            model.gte_map_hits++;
+            model.gte_instructions++;
+            if (gte_id & GTE_ID_ENTRY) {
+                model.gte_entries++;
+                model.gte_counts[operation]++;
+                model.gte_work += gte_ranges[range].work;
+            }
+        }
         if (tb->hot && tb->hot[index]) {
             tb->hot[index]->executions++;
         }
         if (!cache_access_instruction(&model.icache, tb->pc[index])) {
             model.i_misses++;
+            if (gte_id != GTE_ID_NONE) {
+                model.gte_i_misses++;
+            }
             if (pc_is_rec_code(tb->pc[index])) {
                 model.rec_i_misses++;
             }
@@ -1015,6 +1485,7 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     uint64_t last_vaddr;
     unsigned int size_shift;
     int rec_code_store;
+    unsigned char gte_id = GTE_ID_NONE;
 
     (void)vcpu_index;
     if (model.frame_frozen) {
@@ -1028,6 +1499,7 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
 
         hot = mem->hot;
         pc = mem->pc;
+        gte_id = mem->gte_id;
     }
     if (!pc_is_selected(pc)) {
         return;
@@ -1075,11 +1547,18 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
         model.stores++;
     }
     model.d_lines++;
+    if (gte_id != GTE_ID_NONE) {
+        model.gte_d_accesses++;
+        model.gte_d_lines++;
+    }
     if (pc_is_rec_code(pc)) {
         model.rec_d_lines++;
     }
     if (!cache_access_indexed(&model.dcache, address, index_address)) {
         model.d_misses++;
+        if (gte_id != GTE_ID_NONE) {
+            model.gte_d_misses++;
+        }
         if (pc_is_rec_code(pc)) {
             model.rec_d_misses++;
         }
@@ -1096,12 +1575,18 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     if ((last_address >> model.dcache.line_shift) !=
         (address >> model.dcache.line_shift)) {
         model.d_lines++;
+        if (gte_id != GTE_ID_NONE) {
+            model.gte_d_lines++;
+        }
         if (pc_is_rec_code(pc)) {
             model.rec_d_lines++;
         }
         if (!cache_access_indexed(&model.dcache, last_address,
                                   last_index_address)) {
             model.d_misses++;
+            if (gte_id != GTE_ID_NONE) {
+                model.gte_d_misses++;
+            }
             if (pc_is_rec_code(pc)) {
                 model.rec_d_misses++;
             }
@@ -1233,9 +1718,11 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     data->rec_count = 0;
     data->pc = calloc(data->count, sizeof(*data->pc));
     data->class_id = calloc(data->count, sizeof(*data->class_id));
-    if (!data->pc || !data->class_id) {
+    data->gte_id = calloc(data->count, sizeof(*data->gte_id));
+    if (!data->pc || !data->class_id || !data->gte_id) {
         free(data->pc);
         free(data->class_id);
+        free(data->gte_id);
         free(data);
         return;
     }
@@ -1244,6 +1731,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         if (!data->hot) {
             free(data->pc);
             free(data->class_id);
+            free(data->gte_id);
             free(data);
             return;
         }
@@ -1254,6 +1742,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         uint32_t opcode = 0;
 
         data->pc[index] = qemu_plugin_insn_vaddr(insn);
+        data->gte_id[index] = gte_id_for_pc(data->pc[index]);
         if (pc_is_rec_code(data->pc[index])) {
             data->rec_count++;
         }
@@ -1274,6 +1763,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
             if (mem && pc_is_selected(data->pc[index])) {
                 mem->pc = data->pc[index];
+                mem->gte_id = data->gte_id[index];
                 if (data->hot) {
                     data->hot[index] = hotspot_lookup(data->pc[index]);
                     if (data->hot[index]) {
@@ -1309,6 +1799,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     (void)userdata;
     if (!model.frame_frozen) {
         write_report("exit");
+    }
+    if (model.gte_enabled && !model.gte_entries) {
+        fprintf(stderr,
+                "sf2000-cache-model: gtemap matched no GTE entries "
+                "(stale layout or workload did not enter GTE)\n");
     }
     cache_destroy(&model.icache);
     cache_destroy(&model.dcache);
@@ -1433,6 +1928,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             snprintf(model.label, sizeof(model.label), "%s", value);
         } else if (key_length == 8 && strncmp(key, "hotspots", key_length) == 0) {
             snprintf(model.hot_path, sizeof(model.hot_path), "%s", value);
+        } else if (key_length == 6 && strncmp(key, "gtemap", key_length) == 0) {
+            snprintf(model.gte_map_path, sizeof(model.gte_map_path), "%s",
+                     value);
+        } else if (key_length == 7 && strncmp(key, "coreelf", key_length) == 0) {
+            snprintf(model.gte_core_elf, sizeof(model.gte_core_elf), "%s",
+                     value);
         } else if (key_length == 7 && strncmp(key, "recbase", key_length) == 0) {
             if (strcmp(value, "auto") == 0) {
                 rec_base = UINT64_C(0x83200000);
@@ -1477,6 +1978,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     model.core_base = core_base;
     model.core_end = core_base + core_size;
     model.rec_base_auto = rec_base_auto;
+    if (model.gte_map_path[0] && load_gte_map(model.gte_map_path) != 0) {
+        cache_destroy(&model.icache);
+        cache_destroy(&model.dcache);
+        return -1;
+    }
     /* A core-only run is deliberately boot-inclusive for the selected text:
      * waiting for a recRAM block would skip the static executable TBs that we
      * want to measure. */
@@ -1518,7 +2024,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=12 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=13 target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
@@ -1527,7 +2033,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             " coresize=0x%016" PRIx64
             " frameopcode=0x%08" PRIx32
             " framereport=%" PRIu64 " framestop=%" PRIu64
-            " coverage=%s\n",
+            " coverage=%s gte_map=%s gte_map_entries=%" PRIu64
+            " gte_core_sha256=%s\n",
             info->target_name ? info->target_name : "unknown", size, line,
             ways, model.sample, model.instruction_penalty, model.data_penalty,
             model.d_vipt ? "vipt" : "pipt", model.d_vipt ? "vipt" : "phys",
@@ -1536,7 +2043,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             model.phase_rec ? "rec" : "boot", scope_label(),
             model.core_base, model.core_end - model.core_base,
             model.frame_opcode, model.frame_report_period, model.frame_stop,
-            coverage_label());
+            coverage_label(), model.gte_enabled ? model.gte_map_path : "off",
+            model.gte_map_entries,
+            model.gte_enabled ? model.gte_core_sha256 : "none");
     fflush(model.out);
     model.next_sample = model.sample;
     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
