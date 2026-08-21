@@ -464,10 +464,25 @@ QPSX_BENCHMARK_FRAMES ?= 0
 # long a heavily instrumented QEMU run needs. A wall-clock timeout remains as
 # a failure bound when the guest never reaches the requested endpoint.
 QPSX_BENCHMARK_WAIT_FOR_FRAME ?= 1
+# The browser accepts this opt-in command-line path before drawing its home
+# menu.  Keeping it configurable makes QEMU and physical A/B runs start at
+# the same frame without injecting timing-sensitive key events.
+QPSX_BENCHMARK_AUTO_LAUNCH ?=
+# New no-menu test images carry browser_startup.cfg. Set this to 0 only when
+# comparing against an older image whose browser predates direct launch.
+QPSX_BENCHMARK_DIRECT ?= 1
+# The fast cache-model target deliberately reuses the already-built ASD. Set
+# this to 1 only after changing the baked kernel command line or rootfs; it
+# avoids rebuilding the kernel/rootfs for every core/cache A/B experiment.
+QPSX_BENCHMARK_REBUILD_ASD ?= 0
 QPSX_BENCHMARK_CMDLINE = $(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 \
-	$(if $(filter-out 0,$(QPSX_BENCHMARK_FRAMES)),SF2000_BENCHMARK_FRAMES=$(QPSX_BENCHMARK_FRAMES),)
+	$(if $(filter-out 0,$(QPSX_BENCHMARK_FRAMES)),SF2000_BENCHMARK_FRAMES=$(QPSX_BENCHMARK_FRAMES),) \
+	$(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)
 SDCARD_QPSX_STARTUP_CONFIG := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg
 SDCARD_QPSX_STARTUP_CHECKSUM := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg.sha256
+SDCARD_BROWSER_STARTUP_CONFIG := $(BUILD_DIR)/sdcard/cores/config/browser_startup.cfg
+SDCARD_BROWSER_STARTUP_CHECKSUM := $(BUILD_DIR)/sdcard/cores/config/browser_startup.cfg.sha256
+QPSX_AUTO_LAUNCH_PATH ?= /mnt/sd/PSX/00-TEST.cue
 FRONTEND_LIFECYCLE_TEST_SD := $(BUILD_DIR)/frontend-lifecycle-test.sd.img
 JS2300_TEST_SD := $(BUILD_DIR)/js2300-test.sd.img
 JS2300_UI_SMOKE_SCRIPT := $(FRONTEND_PROJECT)/tests/js2300-ui-smoke.js
@@ -511,11 +526,12 @@ QEMU_CACHE_MODEL_SAMPLE ?= 10000000
 QEMU_CACHE_MODEL_IPENALTY ?= 8
 QEMU_CACHE_MODEL_DPENALTY ?= 12
 QEMU_CACHE_MODEL_LABEL ?= qpsx
-# recMem is printed by QPSX at startup; keep this default synchronized with
-# the current static-PIE layout and override it when a build logs another
-# address.  Using the old kernel-range default silently poisoned rec samples.
-QEMU_CACHE_MODEL_RECBASE ?= 0x83214f14
-QEMU_CACHE_MODEL_RECSIZE ?= 0x800000
+# recMem is printed by QPSX at startup.  Source/flag changes move the static
+# buffer by a few hundred bytes, so the default plugin mode uses a conservative
+# executable-only 8.5 MiB window and reports the observed rec PC range.  Pass
+# an exact address when doing a forensic profile of one binary.
+QEMU_CACHE_MODEL_RECBASE ?= auto
+QEMU_CACHE_MODEL_RECSIZE ?= 0x880000
 QEMU_CACHE_MODEL_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-model.log
 QEMU_CACHE_MODEL_HOT_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-hotspots.log
 GE_VENDOR_ARCHIVE ?= $(HCRTOS_SDK_DIR)/lib/vendor/libge.a
@@ -2429,7 +2445,8 @@ linux-full-test-asd:
 # mistaken for a physical-device build.
 physical-linux-asd:
 	# Remove a prior diagnostic before syncing the normal physical artifact.
-	rm -f '$(SDCARD_QPSX_STARTUP_CONFIG)' '$(SDCARD_QPSX_STARTUP_CHECKSUM)'
+	rm -f '$(SDCARD_QPSX_STARTUP_CONFIG)' '$(SDCARD_QPSX_STARTUP_CHECKSUM)' \
+		'$(SDCARD_BROWSER_STARTUP_CONFIG)' '$(SDCARD_BROWSER_STARTUP_CHECKSUM)'
 	$(ISOLATED_MAKE) ROOTFS=full SDCARD_ASD_SYNC=1 linux-asd
 
 ifeq ($(SDCARD_ASD_SYNC),1)
@@ -2658,8 +2675,8 @@ $(QPSX_REAL_TEST_BASE_PROFILE): FORCE $(SDCARD_USER_CONFIG) \
 	mkdir -p '$(dir $@)'
 	@set -eu; \
 	tmp='$@.tmp'; \
-	{ \
-		printf 'menu_at_start=%s\nmin_mib=%s\nimage=%s\n' \
+		{ \
+		printf 'startup_format=2\nmenu_at_start=%s\nmin_mib=%s\nimage=%s\n' \
 			'$(QPSX_REAL_MENU_AT_START)' '$(QPSX_REAL_TEST_MIN_MIB)' \
 			'$(QPSX_REAL_IMAGE)'; \
 		sha256sum '$(SDCARD_USER_CONFIG)' '$(SDCARD_UI_FONT)' \
@@ -2745,6 +2762,12 @@ $(QPSX_REAL_TEST_SD): $(QPSX_REAL_TEST_BASE_PROFILE)
 		mcopy -i '$(QPSX_REAL_TEST_SD)' '$(BUILD_DIR)'/.qpsx-startup.cfg \
 			::/cores/config/psx_startup.cfg; \
 		rm -f '$(BUILD_DIR)'/.qpsx-startup.cfg; \
+		browser_path='/mnt/sd/PSX/TEST.BIN'; \
+		case '$(QPSX_REAL_IMAGE)' in *.[cC][uU][eE]) browser_path='/mnt/sd/PSX/00-TEST.cue';; esac; \
+		printf 'auto_launch=%s\n' "$$browser_path" > '$(BUILD_DIR)'/.browser-startup.cfg; \
+		mcopy -i '$(QPSX_REAL_TEST_SD)' '$(BUILD_DIR)'/.browser-startup.cfg \
+			::/cores/config/browser_startup.cfg; \
+		rm -f '$(BUILD_DIR)'/.browser-startup.cfg; \
 	fi
 	rm -f '$(BUILD_DIR)'/.qpsx-real-test.cfg
 	mcopy -i '$(QPSX_REAL_TEST_SD)' '$(SDCARD_UI_FONT)' ::/sf2000/ui.ttf
@@ -2872,8 +2895,10 @@ qpsx-no-menu-physical: physical-linux-asd
 	mkdir -p '$(dir $(SDCARD_QPSX_STARTUP_CONFIG))'
 	printf 'menu_at_start=0\nauto_menu=0\n' > '$(SDCARD_QPSX_STARTUP_CONFIG)'
 	( cd '$(BUILD_DIR)/sdcard' && sha256sum 'cores/config/psx_startup.cfg' ) > '$(SDCARD_QPSX_STARTUP_CHECKSUM)'
+	printf 'auto_launch=%s\n' '$(QPSX_AUTO_LAUNCH_PATH)' > '$(SDCARD_BROWSER_STARTUP_CONFIG)'
+	( cd '$(BUILD_DIR)/sdcard' && sha256sum 'cores/config/browser_startup.cfg' ) > '$(SDCARD_BROWSER_STARTUP_CHECKSUM)'
 	@printf 'QPSX no-menu diagnostic staged at %s\n' '$(SDCARD_QPSX_STARTUP_CONFIG)'
-	@printf '%s\n' 'Copy this file together with the normal build/sdcard tree to the test SD card, then launch QPSX without closing an internal menu.'
+	@printf '%s\n' 'Copy the staged config files with the normal build/sdcard tree to enter the configured game without browser or QPSX menu key presses.'
 
 $(BROWSER_TEST_SD): Makefile $(BROWSER_TEST_ROM) $(SDCARD_CORE_STAMP) \
 		$(SDCARD_USER_CONFIG) $(SDCARD_UI_FONT) $(SDCARD_UI_LATIN_FONT)
@@ -3266,13 +3291,15 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 	# ASD loads), so the benchmark targets rebuild the test ASD with the
 	# extended command line; the non-default cmdline keeps SDCARD_ASD_SYNC=0
 	# and never touches the physical-device artifacts.
-	# x/down/x navigates the browser to the game; after launch no further
-	# key is pressed so Ridge Racer's attract sequence (title, menu, demo
-	# race) runs unkeyed and deterministically on the emulated frame
-	# timeline -- an in-game press would perturb the scene under test.
-	(sleep '$(QPSX_BENCHMARK_BOOT_SECONDS)'; printf 'sendkey x 100\n'; sleep 1; \
-		printf 'sendkey down 100\n'; sleep 1; \
-		printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
+	# New no-menu images carry browser_startup.cfg, while an optional
+	# SF2000_AUTO_LAUNCH cmdline overrides it for QEMU. Keep the old key
+	# sequence only as an explicit compatibility fallback for older images.
+	(sleep '$(QPSX_BENCHMARK_BOOT_SECONDS)'; \
+		if test '$(QPSX_BENCHMARK_DIRECT)' != 1; then \
+			printf 'sendkey x 100\n'; sleep 1; \
+			printf 'sendkey down 100\n'; sleep 1; \
+			printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
+		fi; \
 		if test '$(QPSX_BENCHMARK_WAIT_FOR_FRAME)' = 1 && \
 			test '$(QPSX_BENCHMARK_FRAMES)' -gt 0; then \
 			waited=0; \
@@ -3332,14 +3359,15 @@ QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
 # sweep; the default is the 16-KiB, 2-way, 16-byte-line VIPT profile reported
 # by physical SF2000/GB300 kernel logs. QEMU's stock 24Kc CP0 currently reports
 # 2 KiB, so pass QEMU_CACHE_MODEL_SIZE=2048 to model that QEMU mismatch.
-# The rec phase uses the address printed by `QPSX: rec address recMem=...`;
-# pass QEMU_CACHE_MODEL_RECBASE when the core's PIE layout changes.
+# The default recbase=auto window follows static Linux PIE layouts; pass an
+# exact QEMU_CACHE_MODEL_RECBASE when the core is deliberately linked outside
+# the normal 0x832xxxxx recMem window.
 benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
 	: > '$(QEMU_CACHE_MODEL_LOG)'
 	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	$(MAKE) run-linux-qpsx-attract-benchmark \
-		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES)' \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' \
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
 		QPSX_BENCHMARK_ASD_TARGET='$(QEMU_CACHE_MODEL_ASD_TARGET)' \
 		QPSX_BENCHMARK_SD_TARGET='$(QEMU_CACHE_MODEL_SD_TARGET)' \
@@ -3352,8 +3380,10 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
 	test -n "$$logged_recbase" || { echo 'QEMU model: missing QPSX recMem fingerprint' >&2; exit 2; }; \
-	test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
-		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' != auto; then \
+		test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
+		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }; \
+	fi
 	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	grep -q 'sf2000-frontend: benchmark frame limit reached' \
@@ -3369,10 +3399,10 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	test -s '$(BUILD_DIR)/sf2000-linux-full.asd'
 	test -s '$(QPSX_REAL_TEST_SD)'
-	$(if $(filter-out 0,$(QEMU_CACHE_MODEL_FRAMES)),\
+	$(if $(and $(filter-out 0,$(QEMU_CACHE_MODEL_FRAMES)),$(filter 1,$(QPSX_BENCHMARK_REBUILD_ASD))),\
 	$(MAKE) --no-print-directory ROOTFS=full SDCARD_ASD_SYNC=0 \
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
-		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES)' linux-full-test-asd,)
+			LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' linux-full-test-asd,)
 	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
 		grep -q '^menu_at_start=0$$'
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
@@ -3380,7 +3410,7 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	$(MAKE) --no-print-directory run-linux-qpsx-attract-benchmark \
 		QPSX_BENCHMARK_ASD_TARGET= QPSX_BENCHMARK_SD_TARGET= \
-		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES)' \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' \
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
 		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
@@ -3391,12 +3421,16 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
 	test -n "$$logged_recbase" || { echo 'QEMU model: missing QPSX recMem fingerprint' >&2; exit 2; }; \
-	test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
-		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' != auto; then \
+		test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
+		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }; \
+	fi
 	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
-	grep -q 'sf2000-frontend: benchmark frame limit reached' \
-		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	$(if $(filter 1,$(QPSX_BENCHMARK_REBUILD_ASD)),\
+		grep -q 'sf2000-frontend: benchmark frame limit reached' \
+			'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log',\
+		@printf '%s\n' 'QEMU cache model: reusing ASD; frame-limit marker intentionally not required')
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	@tail -n 3 '$(QEMU_CACHE_MODEL_LOG)'
 

@@ -79,6 +79,8 @@ typedef struct {
     uint64_t i_misses;
     uint64_t d_accesses;
     uint64_t d_lines;
+    uint64_t d_bytes;
+    uint64_t d_size_counts[4];
     uint64_t d_misses;
     uint64_t stores;
     uint64_t mmio;
@@ -93,10 +95,13 @@ typedef struct {
     uint64_t insn_classes[INSN_CLASS_COUNT];
     uint64_t rec_base;
     uint64_t rec_end;
+    int rec_base_auto;
     uint64_t rec_i_accesses;
     uint64_t rec_i_misses;
     uint64_t rec_d_accesses;
     uint64_t rec_d_lines;
+    uint64_t rec_d_bytes;
+    uint64_t rec_d_size_counts[4];
     uint64_t rec_d_misses;
     uint64_t rec_insn_classes[INSN_CLASS_COUNT];
     uint64_t rec_tb_execs;
@@ -390,6 +395,8 @@ static void reset_measurement(void)
     model.i_misses = 0;
     model.d_accesses = 0;
     model.d_lines = 0;
+    model.d_bytes = 0;
+    memset(model.d_size_counts, 0, sizeof(model.d_size_counts));
     model.d_misses = 0;
     model.stores = 0;
     model.mmio = 0;
@@ -404,6 +411,8 @@ static void reset_measurement(void)
     model.rec_i_misses = 0;
     model.rec_d_accesses = 0;
     model.rec_d_lines = 0;
+    model.rec_d_bytes = 0;
+    memset(model.rec_d_size_counts, 0, sizeof(model.rec_d_size_counts));
     model.rec_d_misses = 0;
     memset(model.rec_insn_classes, 0, sizeof(model.rec_insn_classes));
     model.rec_tb_execs = 0;
@@ -512,7 +521,7 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=6 sample=%" PRIu64
+            "# sf2000-cache-model hotspots version=9 sample=%" PRIu64
             " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
             " label=%s\n",
             model.sample_no, kind, model.instructions,
@@ -546,6 +555,7 @@ static void write_hotspots(const char *kind)
 
 static void write_report(const char *kind)
 {
+    size_t index;
     uint64_t estimated_cycles;
     uint64_t i_miss_ppm;
     uint64_t d_miss_ppm;
@@ -561,6 +571,14 @@ static void write_report(const char *kind)
     uint64_t delta_instructions;
     uint64_t delta_i_misses;
     uint64_t delta_d_misses;
+    uint64_t helper_i_accesses;
+    uint64_t helper_i_misses;
+    uint64_t helper_d_accesses;
+    uint64_t helper_d_lines;
+    uint64_t helper_d_bytes;
+    uint64_t helper_d_misses;
+    uint64_t helper_instructions;
+    uint64_t helper_d_size_counts[4];
 
     if (!model.out) {
         return;
@@ -577,6 +595,26 @@ static void write_report(const char *kind)
     rec_i_miss_share_ppm = ratio_ppm(model.rec_i_misses, model.i_misses);
     rec_d_miss_share_ppm = ratio_ppm(model.rec_d_misses, model.d_misses);
     rec_d_line_miss_ppm = ratio_ppm(model.rec_d_misses, model.rec_d_lines);
+    helper_i_accesses = model.i_accesses >= model.rec_i_accesses ?
+                        model.i_accesses - model.rec_i_accesses : 0;
+    helper_i_misses = model.i_misses >= model.rec_i_misses ?
+                      model.i_misses - model.rec_i_misses : 0;
+    helper_d_accesses = model.d_accesses >= model.rec_d_accesses ?
+                        model.d_accesses - model.rec_d_accesses : 0;
+    helper_d_lines = model.d_lines >= model.rec_d_lines ?
+                     model.d_lines - model.rec_d_lines : 0;
+    helper_d_bytes = model.d_bytes >= model.rec_d_bytes ?
+                     model.d_bytes - model.rec_d_bytes : 0;
+    helper_d_misses = model.d_misses >= model.rec_d_misses ?
+                      model.d_misses - model.rec_d_misses : 0;
+    helper_instructions = model.instructions >= model.rec_i_accesses ?
+                          model.instructions - model.rec_i_accesses : 0;
+    for (index = 0; index < sizeof(helper_d_size_counts) /
+                         sizeof(helper_d_size_counts[0]); index++) {
+        helper_d_size_counts[index] =
+            model.d_size_counts[index] >= model.rec_d_size_counts[index] ?
+            model.d_size_counts[index] - model.rec_d_size_counts[index] : 0;
+    }
     rec_cf_ppm = ratio_ppm(model.rec_insn_classes[INSN_BRANCH] +
                            model.rec_insn_classes[INSN_JUMP],
                            model.rec_i_accesses);
@@ -598,6 +636,9 @@ static void write_report(const char *kind)
             " scope=%s coverage=%s"
             " i_accesses=%" PRIu64 " i_misses=%" PRIu64
             " d_accesses=%" PRIu64 " d_lines=%" PRIu64
+            " d_bytes=%" PRIu64 " d_size1=%" PRIu64
+            " d_size2=%" PRIu64 " d_size4=%" PRIu64
+            " d_size8p=%" PRIu64
             " d_misses=%" PRIu64 " stores=%" PRIu64 " mmio=%" PRIu64
             " i_miss_ppm=%" PRIu64 " d_miss_ppm=%" PRIu64
             " rec_i_ppm=%" PRIu64 " rec_d_ppm=%" PRIu64
@@ -606,7 +647,8 @@ static void write_report(const char *kind)
             " rec_d_miss_share_ppm=%" PRIu64
             " rec_d_lines=%" PRIu64 " rec_d_line_miss_ppm=%" PRIu64
             " rec_cf_ppm=%" PRIu64 " rec_unique_lines=%" PRIu64
-            " rec_code_span=%" PRIu64 " rec_tb_execs=%" PRIu64
+            " rec_code_span=%" PRIu64 " rec_pc_low=0x%016" PRIx64
+            " rec_pc_high=0x%016" PRIx64 " rec_tb_execs=%" PRIu64
             " branches=%" PRIu64 " jumps=%" PRIu64
             " loads=%" PRIu64 " store_insns=%" PRIu64
             " muldiv=%" PRIu64 " cop2=%" PRIu64
@@ -614,19 +656,38 @@ static void write_report(const char *kind)
             " rec_loads=%" PRIu64 " rec_store_insns=%" PRIu64
             " rec_muldiv=%" PRIu64 " rec_cop2=%" PRIu64
             " rec_i_accesses=%" PRIu64 " rec_i_misses=%" PRIu64
-            " rec_d_accesses=%" PRIu64 " rec_d_misses=%" PRIu64
+            " rec_d_accesses=%" PRIu64 " rec_d_bytes=%" PRIu64
+            " rec_d_size1=%" PRIu64 " rec_d_size2=%" PRIu64
+            " rec_d_size4=%" PRIu64 " rec_d_size8p=%" PRIu64
+            " rec_d_misses=%" PRIu64
+            " native_instructions=%" PRIu64
+            " native_d_accesses=%" PRIu64 " native_d_lines=%" PRIu64
+            " native_d_bytes=%" PRIu64 " native_d_size1=%" PRIu64
+            " native_d_size2=%" PRIu64 " native_d_size4=%" PRIu64
+            " native_d_size8p=%" PRIu64
+            " native_d_misses=%" PRIu64
+            " helper_i_accesses=%" PRIu64 " helper_i_misses=%" PRIu64
+            " helper_i_miss_ppm=%" PRIu64 " helper_i_miss_share_ppm=%" PRIu64
+            " helper_d_accesses=%" PRIu64 " helper_d_lines=%" PRIu64
+            " helper_d_misses=%" PRIu64 " helper_d_miss_ppm=%" PRIu64
+            " helper_d_miss_share_ppm=%" PRIu64
             " est_cycles=%" PRIu64 " delta_instructions=%" PRIu64
             " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64 "\n",
             model.sample_no, kind, model.label, model.instructions,
             model.rec_only ? "rec" : "all",
             coverage_label(),
             model.i_accesses, model.i_misses, model.d_accesses,
-            model.d_lines, model.d_misses, model.stores, model.mmio,
+            model.d_lines, model.d_bytes, model.d_size_counts[0],
+            model.d_size_counts[1], model.d_size_counts[2],
+            model.d_size_counts[3], model.d_misses, model.stores,
+            model.mmio,
             i_miss_ppm, d_miss_ppm, rec_i_ppm, rec_d_ppm,
             rec_i_miss_ppm, rec_d_miss_ppm,
             rec_i_miss_share_ppm, rec_d_miss_share_ppm,
             model.rec_d_lines, rec_d_line_miss_ppm, rec_cf_ppm,
-            model.rec_unique_lines, rec_code_span, model.rec_tb_execs,
+            model.rec_unique_lines, rec_code_span,
+            model.rec_pc_low == UINT64_MAX ? 0 : model.rec_pc_low,
+            model.rec_pc_high, model.rec_tb_execs,
             model.insn_classes[INSN_BRANCH], model.insn_classes[INSN_JUMP],
             model.insn_classes[INSN_LOAD], model.insn_classes[INSN_STORE],
             model.insn_classes[INSN_MULDIV], model.insn_classes[INSN_COP2],
@@ -637,7 +698,20 @@ static void write_report(const char *kind)
             model.rec_insn_classes[INSN_MULDIV],
             model.rec_insn_classes[INSN_COP2],
             model.rec_i_accesses, model.rec_i_misses,
-            model.rec_d_accesses, model.rec_d_misses,
+            model.rec_d_accesses, model.rec_d_bytes,
+            model.rec_d_size_counts[0], model.rec_d_size_counts[1],
+            model.rec_d_size_counts[2], model.rec_d_size_counts[3],
+            model.rec_d_misses, helper_instructions,
+            helper_d_accesses, helper_d_lines, helper_d_bytes,
+            helper_d_size_counts[0], helper_d_size_counts[1],
+            helper_d_size_counts[2], helper_d_size_counts[3],
+            helper_d_misses,
+            helper_i_accesses, helper_i_misses,
+            ratio_ppm(helper_i_misses, helper_i_accesses),
+            ratio_ppm(helper_i_misses, model.i_misses),
+            helper_d_accesses, helper_d_lines, helper_d_misses,
+            ratio_ppm(helper_d_misses, helper_d_lines),
+            ratio_ppm(helper_d_misses, model.d_misses),
             estimated_cycles, delta_instructions, delta_i_misses,
             delta_d_misses);
     fflush(model.out);
@@ -746,6 +820,17 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     size_shift = qemu_plugin_mem_size_shift(info);
     if (size_shift > 20) {
         size_shift = 20;
+    }
+    {
+        unsigned int size_class = size_shift < 3 ? size_shift : 3;
+        uint64_t access_bytes = UINT64_C(1) << size_shift;
+
+        model.d_bytes += access_bytes;
+        model.d_size_counts[size_class]++;
+        if (pc_is_rec_code(pc)) {
+            model.rec_d_bytes += access_bytes;
+            model.rec_d_size_counts[size_class]++;
+        }
     }
     last_address = address + ((UINT64_C(1) << size_shift) - 1);
     last_vaddr = vaddr + ((UINT64_C(1) << size_shift) - 1);
@@ -950,8 +1035,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     /* QPSX's Linux NOMMU PIE currently reports this recMem address in its
      * startup fingerprint.  The old 0x80800000 default overlapped kernel
      * text, producing convincing but completely wrong “rec” samples. */
-    uint64_t rec_base = UINT64_C(0x83214f14);
-    uint64_t rec_size = UINT64_C(0x00800000);
+    /* Static recMem is linked in the executable's .bss.  Small source/flag
+     * changes move it by a few hundred bytes, while generated code remains
+     * in the otherwise-unused 0x832xxxxx window.  'auto' uses a conservative
+     * 8.5 MiB window so cache A/B runs do not silently classify the first
+     * block as helper code whenever the core layout changes. */
+    uint64_t rec_base = UINT64_C(0x83200000);
+    uint64_t rec_size = UINT64_C(0x00880000);
+    int rec_base_auto = 1;
     int index;
     const char *out_path = NULL;
 
@@ -1028,7 +1119,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (key_length == 8 && strncmp(key, "hotspots", key_length) == 0) {
             snprintf(model.hot_path, sizeof(model.hot_path), "%s", value);
         } else if (key_length == 7 && strncmp(key, "recbase", key_length) == 0) {
-            rec_base = parse_u64(value, rec_base);
+            if (strcmp(value, "auto") == 0) {
+                rec_base = UINT64_C(0x83200000);
+                rec_base_auto = 1;
+            } else {
+                rec_base = parse_u64(value, rec_base);
+                rec_base_auto = 0;
+            }
         } else if (key_length == 7 && strncmp(key, "recsize", key_length) == 0) {
             rec_size = parse_u64(value, rec_size);
         } else {
@@ -1051,6 +1148,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     model.rec_base = rec_base;
     model.rec_end = rec_base + rec_size;
+    model.rec_base_auto = rec_base_auto;
     model.rec_line_count = (size_t)((rec_size + line - 1) / line);
     if (model.rec_line_count > SIZE_MAX - 7 ||
         !(model.rec_line_bits = calloc((model.rec_line_count + 7) / 8, 1))) {
@@ -1085,16 +1183,18 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=6 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=9 target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
-            " recsize=0x%016" PRIx64 " imode=%s phase=%s scope=%s"
+            " recbase_mode=%s recsize=0x%016" PRIx64
+            " imode=%s phase=%s scope=%s"
             " coverage=%s\n",
             info->target_name ? info->target_name : "unknown", size, line,
             ways, model.sample, model.instruction_penalty, model.data_penalty,
             model.d_vipt ? "vipt" : "pipt", model.d_vipt ? "vipt" : "phys",
-            rec_base, rec_size, model.i_vipt ? "vipt" : "pipt",
+            rec_base, rec_base_auto ? "auto" : "exact", rec_size,
+            model.i_vipt ? "vipt" : "pipt",
             model.phase_rec ? "rec" : "boot", model.rec_only ? "rec" : "all",
             coverage_label());
     fflush(model.out);
