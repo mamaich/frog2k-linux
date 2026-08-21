@@ -3334,7 +3334,7 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 			sleep '$(QPSX_BENCHMARK_SECONDS)'; \
 		fi; \
 		printf 'quit\n') | \
-		SF2000_SCANOUT_ORACLE=0 '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
+		SF2000_SCANOUT_ORACLE=0 SF2000_GE_PROFILE='$(QEMU_GE_PROFILE)' '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
 		$(QEMU_PERF_ARGS) $(QEMU_PLUGIN_ARGS) \
 		-kernel '$(BUILD_DIR)'/sf2000-linux-full.asd \
 		-drive if=none,id=sd0,file='$(QPSX_REAL_TEST_SD)',format=raw \
@@ -3370,6 +3370,10 @@ QEMU_CACHE_MODEL_BOOT_SECONDS ?= 5
 QEMU_CACHE_MODEL_SECONDS ?= 45
 QEMU_CACHE_MODEL_FRAMES ?= 2700
 QEMU_CACHE_MODEL_QEMU_ARGS ?=
+# Deterministic GE command-work counters for the same benchmark. Keep this
+# off by default; enabling it adds only sparse log lines and never changes GE
+# timing or guest-visible behavior.
+QEMU_GE_PROFILE ?= 0
 QEMU_CACHE_MODEL_ASD_TARGET ?= linux-full-test-asd
 QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
 
