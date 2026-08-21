@@ -442,6 +442,9 @@ QPSX_REAL_TEST_CORE_PROFILE := $(BUILD_DIR)/qpsx-real-test.core-profile
 QPSX_REAL_TEST_CORE_STAMP := $(BUILD_DIR)/qpsx-real-test.core-installed
 QPSX_OPTIMIZE ?= -O2
 QPSX_TEST_CORE ?= $(BUILD_DIR)/sdcard/sf2000/cores/sf2000-qpsx
+QPSX_VARIANT ?= baseline
+QPSX_VARIANTS_DIR := $(FRONTEND_PROJECT)/build/qpsx-variants
+QPSX_VARIANT_CORE := $(QPSX_VARIANTS_DIR)/sf2000-qpsx-$(QPSX_VARIANT)
 QPSX_AUDIT_STAMP := $(BUILD_DIR)/sdcard/sf2000/cores/.qpsx-mips32r1-audited
 QPSX_REAL_CORE_DEP ?= qpsx-mips32r1-audit
 QPSX_BENCHMARK_SD_TARGET ?= qpsx-no-menu-test-sd
@@ -538,7 +541,8 @@ run-qemu-stock-fatfs-writeback smoke-qemu-stock-fatfs-writeback \
 	run-linux-snes9x2005 smoke-linux-snes9x2005 \
 	run-linux-snes9x2002 smoke-linux-snes9x2002 \
 	gpsp-real-test-sd run-linux-gpsp-real smoke-linux-gpsp-real \
-	qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
+qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
+	qpsx-production-sweep qpsx-production-benchmark qpsx-stage-variant \
 	run-linux-qpsx-real smoke-linux-qpsx-real \
 	qpsx-no-menu-test-sd run-linux-qpsx-no-menu smoke-linux-qpsx-no-menu \
 	qpsx-dev-real-test-sd qpsx-dev-no-menu-test-sd \
@@ -599,6 +603,9 @@ help:
 		'make METRICS_LOG=loglinux.txt metrics-frontend  summarize emulator sessions' \
 		'make smoke-linux-full-asd  boot the full-rootfs artifact in QEMU' \
 		'make qpsx-production-real-test-sd QPSX_REAL_IMAGE=...  rebuild/audit/stage only the production QPSX core' \
+		'make qpsx-production-sweep  build four named QPSX physical A/B variants' \
+		'make qpsx-production-benchmark  run the four variants against one no-menu QEMU image' \
+		'make qpsx-stage-variant QPSX_VARIANT=baseline  copy one swept core into the existing test SD image' \
 		'make qpsx-dev-real-test-sd QPSX_REAL_IMAGE=...  rebuild/stage the incremental profiler QPSX core' \
 		'make smoke-linux-full-ge-no-irq  boot with the GE completion IRQ suppressed' \
 		'make smoke-linux-full-stale-ram  boot with stale garbage prefill in RAM' \
@@ -2732,6 +2739,57 @@ qpsx-production-real-test-sd: FORCE
 		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))'
 	$(MAKE) qpsx-real-test-sd QPSX_REAL_CORE_DEP= \
 		QPSX_TEST_CORE='$(FRONTEND_PROJECT)/build/sf2000-qpsx'
+
+# Produce baseline/return-register/small-superblock/large-superblock cores in
+# one controlled pass.  The frontend records the exact flags and hashes in
+# build/qpsx-variants/MANIFEST; no game image or ASD is rebuilt.
+qpsx-production-sweep: FORCE
+	$(FRONTEND_MAKE) qpsx-production-sweep \
+		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))' \
+		QPSX_OPTIMIZE='$(QPSX_OPTIMIZE)'
+
+# Run the complete production matrix against the same already-built, no-menu
+# SD image.  The image is deliberately not a prerequisite: recreating a 128 MiB
+# FAT image or recopied CD is much slower and would make an A/B result harder to
+# attribute.  Prepare it once with qpsx-no-menu-test-sd, then this target only
+# swaps the small core file and launches the deterministic uncapped benchmark.
+qpsx-production-benchmark: qpsx-production-sweep FORCE
+	@set -eu; \
+	test -f '$(QPSX_REAL_TEST_SD)' || { \
+		echo 'missing QPSX test SD image; run qpsx-no-menu-test-sd QPSX_REAL_IMAGE=...' >&2; exit 2; }; \
+	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
+		grep -q '^menu_at_start=0$$' || { \
+		echo 'QPSX benchmark requires a no-menu SD image; run qpsx-no-menu-test-sd first' >&2; exit 2; }; \
+	out='$(BUILD_DIR)/logs/qpsx-variant-benchmark'; \
+	mkdir -p "$$out"; \
+	: > "$$out/SUMMARY"; \
+	for variant in baseline return-ra fold2 fold8; do \
+		$(MAKE) --no-print-directory qpsx-stage-variant QPSX_VARIANT="$$variant"; \
+		$(MAKE) --no-print-directory benchmark-linux-qpsx-attract \
+			QPSX_BENCHMARK_SD_TARGET= \
+			QPSX_BENCHMARK_ASD_TARGET=linux-full-test-asd \
+			QPSX_BENCHMARK_SECONDS='$(QPSX_BENCHMARK_SECONDS)' \
+			> "$$out/$$variant.make.log" 2>&1; \
+		cp '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' "$$out/$$variant.log"; \
+		cp '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.console' "$$out/$$variant.console"; \
+		grep 'QPSX Ridge Racer attract benchmark:' "$$out/$$variant.make.log" | tail -n 1 | \
+			sed "s/^/$$variant /" | tee -a "$$out/SUMMARY"; \
+		grep -m 1 'QPSX: build knobs' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
+		grep -m 1 'QPSX: rec telemetry' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
+	done; \
+	cat "$$out/SUMMARY"
+
+# Install one previously swept core into the already-populated test image.
+# This is intentionally separate from qpsx-real-test-sd, so switching between
+# variants never rereads a disc image or reformats the 128 MiB filesystem.
+qpsx-stage-variant: FORCE
+	@test -f '$(QPSX_VARIANT_CORE)' || { \
+		echo 'missing QPSX variant: $(QPSX_VARIANT_CORE); run make qpsx-production-sweep first' >&2; exit 2; }
+	@test -f '$(QPSX_REAL_TEST_SD)' || { \
+		echo 'missing QPSX test SD image: $(QPSX_REAL_TEST_SD); build qpsx-real-test-sd first' >&2; exit 2; }
+	mcopy -o -i '$(QPSX_REAL_TEST_SD)' '$(QPSX_VARIANT_CORE)' \
+		::/sf2000/cores/sf2000-qpsx
+	@sha256sum '$(QPSX_VARIANT_CORE)' '$(QPSX_REAL_TEST_SD)'
 
 # Rebuild and stage only QPSX from its development checkout.  This avoids the
 # all-core SDCARD_CORE_STAMP and is the intended edit/build/QEMU loop.
