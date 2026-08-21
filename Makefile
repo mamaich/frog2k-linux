@@ -3315,8 +3315,11 @@ benchmark-linux-qpsx-attract-dev:
 		QPSX_BENCHMARK_SD_TARGET=qpsx-dev-no-menu-test-sd \
 		QPSX_BENCHMARK_ASD_TARGET=linux-full-test-asd
 
-QEMU_CACHE_MODEL_SECONDS ?= 30
-QEMU_CACHE_MODEL_BOOT_SECONDS ?= 30
+# Rec-phase translation now rejects pre-rec kernel TBs, so five host seconds
+# is enough to reach the browser while retaining a generous frame timeout.
+# Post-rec scope=all screens should override this timeout (typically 220s).
+QEMU_CACHE_MODEL_BOOT_SECONDS ?= 5
+QEMU_CACHE_MODEL_SECONDS ?= 45
 QEMU_CACHE_MODEL_FRAMES ?= 2700
 QEMU_CACHE_MODEL_QEMU_ARGS ?=
 QEMU_CACHE_MODEL_ASD_TARGET ?= linux-full-test-asd
