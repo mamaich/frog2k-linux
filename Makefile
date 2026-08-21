@@ -624,7 +624,7 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	smoke-linux-full-reset-snapshot run-linux-full-reset-restore \
 	smoke-linux-full-reset-restore reverse-ge test-ge-node \
 	test-ge-node-vendor capture-ge-vendor test-ge-vendor-capture \
-	test-ge-source-capture test-ge-formats test-ge-effects \
+	test-ge-source-capture test-ge-formats test-ge-source-formats test-ge-effects \
 	test-ge-mask test-ge-custom-keys test-ge-utils test-ge-matrix \
 	test-ge-queue test-ge-batch test-ge-filter-extract \
 	test-ge-symbol-coverage efuse-test vdec-test vdec-codec-test dsc-test \
@@ -924,7 +924,8 @@ $(GE_LINUX_OBJ): ge/hcge_linux.c ge/ge_api.h $(TOOLCHAIN_STAMP)
 $(GE_VENDOR_CAPTURE): ge/hcge_vendor_capture.c ge/ge_api.h \
 		$(TOOLCHAIN_STAMP) $(GE_VENDOR_ARCHIVE)
 	$(GE_ELF_CC) -std=c99 -O2 -static -Ige -o '$@' '$<' \
-		'$(GE_VENDOR_ARCHIVE)' -lm -Wl,--wrap=open -Wl,--wrap=close \
+		'$(GE_VENDOR_ARCHIVE)' -lm -Wl,--wrap=open -Wl,--wrap=open64 \
+		-Wl,--wrap=close \
 		-Wl,--wrap=ioctl -Wl,--wrap=mmap -Wl,--wrap=munmap \
 		-Wl,--wrap=usleep
 
@@ -938,7 +939,7 @@ $(GE_SOURCE_CAPTURE): ge/hcge_vendor_capture.c ge/hcge_linux.c ge/hcge_node.c ge
 		$(TOOLCHAIN_STAMP)
 	$(GE_ELF_CC) -std=c99 -O2 -static -Ige -DHCGE_SOURCE_CAPTURE \
 		-o '$@' ge/hcge_vendor_capture.c ge/hcge_linux.c ge/hcge_node.c \
-		-Wl,--wrap=open -Wl,--wrap=close -Wl,--wrap=ioctl \
+		-Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=close -Wl,--wrap=ioctl \
 		-Wl,--wrap=mmap -Wl,--wrap=munmap -Wl,--wrap=usleep
 
 test-ge-source-capture: $(GE_SOURCE_CAPTURE) $(GE_SOURCE_CAPTURE_GOLDEN)
@@ -946,12 +947,25 @@ test-ge-source-capture: $(GE_SOURCE_CAPTURE) $(GE_SOURCE_CAPTURE_GOLDEN)
 		cmp - '$(GE_SOURCE_CAPTURE_GOLDEN)'
 
 test-ge-formats: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
-	set -e; for format in 0 1 3 4 7; do \
+	set -e; for format in 0 1 3 4 7 8; do \
 		qemu-mipsel '$(GE_VENDOR_CAPTURE)' 0 0 64 48 0 0 160 120 \
 			"$$format" > '$(BUILD_DIR)/.hcge-vendor-format'; \
 		qemu-mipsel '$(GE_SOURCE_CAPTURE)' 0 0 64 48 0 0 160 120 \
 			"$$format" | cmp - '$(BUILD_DIR)/.hcge-vendor-format'; \
 	done; rm -f '$(BUILD_DIR)/.hcge-vendor-format'
+
+# The vendor serializer accepts BGR555 as a source (the PS1 VRAM layout), but
+# its destination/fill path traps for that format. Exercise the useful source
+# direction against the archive without pretending BGR555 is a valid paint
+# destination.
+test-ge-source-formats: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
+	set -e; HCGE_CAPTURE_SOURCE_FORMAT=9 \
+		qemu-mipsel '$(GE_VENDOR_CAPTURE)' 0 0 64 48 0 0 160 120 1 \
+		> '$(BUILD_DIR)/.hcge-vendor-source-format'; \
+	HCGE_CAPTURE_SOURCE_FORMAT=9 \
+		qemu-mipsel '$(GE_SOURCE_CAPTURE)' 0 0 64 48 0 0 160 120 1 | \
+		cmp - '$(BUILD_DIR)/.hcge-vendor-source-format'; \
+	rm -f '$(BUILD_DIR)/.hcge-vendor-source-format'
 
 test-ge-effects: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 	set -e; for flags in 0 1 2 3 4 5 6 7 8 16 24 32 64 128 512 1024 \

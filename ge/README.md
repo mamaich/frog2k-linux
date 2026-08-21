@@ -54,7 +54,9 @@ small no-MMU programs can pair `hcge_open_context()` with
 `hcge_close_context()` for caller-owned storage. Fill, direct blit, and
 stretch nodes are
 byte-identical to the vendor library for ARGB1555, RGB565, XRGB8888, ARGB8888,
-and ARGB4444. Cropped surfaces use validated physical-address views while
+ARGB4444, and RGB555; PS1-native BGR555 is supported as a source surface
+(the vendor destination path traps for that format). Cropped surfaces use
+validated physical-address views while
 retaining the hardware pitch. Drawing/blitting blend factors, color alpha,
 colorize, A8 source-mask alpha, all six vendor custom source/destination key
 operators, premultiply/demultiply, XOR, flips, and rotations are byte-identical

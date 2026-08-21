@@ -41,6 +41,13 @@ int __wrap_open(const char *path, int flags, ...)
 	return 7;
 }
 
+/* uClibc may select open64 for a pathname even when the source calls open.
+ * Keep the capture harness on the same fake descriptor in that case. */
+int __wrap_open64(const char *path, int flags, ...)
+{
+	return __wrap_open(path, flags);
+}
+
 int __wrap_close(int fd)
 {
 	(void)fd;
@@ -165,7 +172,8 @@ static void setup_state(hcge_state *state)
 		static const HCGESurfacePixelFormat formats[] = {
 			HCGE_DSPF_ARGB1555, HCGE_DSPF_RGB16, HCGE_DSPF_RGB24,
 			HCGE_DSPF_RGB32, HCGE_DSPF_ARGB, HCGE_DSPF_A8,
-			HCGE_DSPF_LUT8, HCGE_DSPF_ARGB4444,
+			HCGE_DSPF_LUT8, HCGE_DSPF_ARGB4444, HCGE_DSPF_RGB555,
+			HCGE_DSPF_BGR555,
 		};
 
 		if (index < sizeof(formats) / sizeof(formats[0])) {
@@ -255,12 +263,16 @@ int main(int argc, char **argv)
 	static const HCGESurfacePixelFormat formats[] = {
 		HCGE_DSPF_ARGB1555, HCGE_DSPF_RGB16, HCGE_DSPF_RGB24,
 		HCGE_DSPF_RGB32, HCGE_DSPF_ARGB, HCGE_DSPF_A8,
-		HCGE_DSPF_LUT8, HCGE_DSPF_ARGB4444,
+		HCGE_DSPF_LUT8, HCGE_DSPF_ARGB4444, HCGE_DSPF_RGB555,
+		HCGE_DSPF_BGR555,
 	};
 	HCGESurfacePixelFormat format = HCGE_DSPF_RGB16;
+	HCGESurfacePixelFormat source_format = HCGE_DSPF_RGB16;
 	unsigned int bytes_per_pixel = 2;
+	unsigned int source_bytes_per_pixel = 2;
 	HCGESurfaceBlittingFlags blittingflags = HCGE_DSBLIT_NOFX;
 	HCGESurfaceDrawingFlags drawingflags = HCGE_DSDRAW_NOFX;
+	const char *source_value;
 
 	if (argc != 1 && argc != 9 && argc != 10 && argc != 12)
 		return 2;
@@ -273,6 +285,18 @@ int main(int argc, char **argv)
 			return 2;
 		format = formats[index];
 		bytes_per_pixel = index == 5 || index == 6 ? 1 :
+			(index == 2 ? 3 : (index == 3 || index == 4 ? 4 : 2));
+	}
+	source_format = format;
+	source_bytes_per_pixel = bytes_per_pixel;
+	source_value = getenv("HCGE_CAPTURE_SOURCE_FORMAT");
+	if (source_value) {
+		unsigned long index = strtoul(source_value, NULL, 0);
+
+		if (index >= sizeof(formats) / sizeof(formats[0]))
+			return 2;
+		source_format = formats[index];
+		source_bytes_per_pixel = index == 5 || index == 6 ? 1 :
 			(index == 2 ? 3 : (index == 3 || index == 4 ? 4 : 2));
 	}
 	if (argc == 12) {
@@ -303,8 +327,8 @@ int main(int argc, char **argv)
 	setup_state(&state);
 	state.destination.config.format = format;
 	state.dst.pitch = 320u * bytes_per_pixel;
-	state.source.config.format = format;
-	state.src.pitch = 128u * bytes_per_pixel;
+	state.source.config.format = source_format;
+	state.src.pitch = 128u * source_bytes_per_pixel;
 	state.blittingflags = blittingflags;
 	state.accel = HCGE_DFXL_BLIT;
 	ctx->state = state;
