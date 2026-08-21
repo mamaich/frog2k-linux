@@ -3425,12 +3425,14 @@ qemu-cache-gte-map:
 		echo 'refusing to overwrite existing GTE map; choose a new path' >&2; exit 2; }
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_GTE_MAP))'
 	core_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+	if grep -q 'gte_rtpt_asm[.]o' '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'; then asm_present=1; else asm_present=0; fi; \
 	{ \
 		printf '# sf2000-gte-map version=1 corebase=%s coresize=%s core_sha256=%s\n' \
 			'$(QEMU_CACHE_MODEL_COREBASE)' '$(QEMU_CACHE_MODEL_CORESIZE)' "$$core_sha"; \
-		awk ' \
+		awk -v asm_present="$$asm_present" ' \
 			function wanted(n) { \
 				return n == "gteRTPS" || n == "gteRTPT" || \
+					n == "gte_RTPT_asm" || \
 					n == "gteMVMVA" || n == "gteNCLIP" || \
 					n == "gteAVSZ3" || n == "gteAVSZ4" || \
 					n == "gteSQR" || n == "gteNCCS" || \
@@ -3444,21 +3446,23 @@ qemu-cache-gte-map:
 					n == "gteCDP" \
 			} \
 			function normalized(n) { \
+				if (n == "gte_RTPT_asm") return "rtpt"; \
 				n = tolower(n); sub(/^gte/, "", n); return n \
 			} \
 			function work(n) { \
-				return n == "gteRTPT" || n == "gteNCCT" || \
+				return n == "gteRTPT" || n == "gte_RTPT_asm" || n == "gteNCCT" || \
 					n == "gteNCDT" || n == "gteDPCT" || n == "gteNCT" ? 3 : 1 \
 			} \
-			/gte\.o/ && $$1 ~ /^0x/ && $$2 ~ /^0x/ { \
+			function source_record() { return /gte\.o/ || /gte_rtpt_asm\.o/ } \
+			source_record() && $$1 ~ /^0x/ && $$2 ~ /^0x/ { \
 				address = $$1; function_size = $$2; pending = 1; next \
 			} \
-			/gte\.o/ && $$2 ~ /^0x/ && $$3 ~ /^0x/ { \
+			source_record() && $$2 ~ /^0x/ && $$3 ~ /^0x/ { \
 				address = $$2; function_size = $$3; pending = 1; next \
 			} \
 			pending { \
 				name = $$2; sub(/\(.*/, "", name); \
-				if (wanted(name)) print "gte " normalized(name) " " address " " function_size " " work(name); \
+				if (wanted(name) && !(asm_present && name == "gteRTPT")) print "gte " normalized(name) " " address " " function_size " " work(name); \
 				pending = 0 \
 			}' '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'; \
 	} > '$(QEMU_CACHE_MODEL_GTE_MAP)'
