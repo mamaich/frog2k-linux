@@ -4,6 +4,7 @@ QEMU_DIR ?= $(abspath ../sf2000_qemu)
 QEMU_ORACLE_DIR ?= $(abspath $(QEMU_DIR))
 QEMU_VERSION ?= 10.2.2
 QEMU_WORK ?= /tmp/sf2000-qemu
+QEMU_SOURCE_DIR ?= $(QEMU_WORK)/qemu-$(QEMU_VERSION)
 HCLINUX_DIR := external/hclinux/2024.02.y.2
 BUILD_DIR ?= build
 INITRAMFS := $(BUILD_DIR)/initramfs.cpio
@@ -14,6 +15,12 @@ ASDPACK := $(BUILD_DIR)/asdpack
 INITRAMFS_DATE ?= 1970-01-01 UTC
 INITRAMFS_EPOCH ?= 0
 QEMU_BIN ?= $(QEMU_WORK)/qemu-$(QEMU_VERSION)/build/qemu-system-mipsel
+QEMU_CACHE_PLUGIN_SRC := tools/qemu/sf2000-cache-model.c
+QEMU_CACHE_PLUGIN := $(BUILD_DIR)/qemu/sf2000-cache-model.so
+# qemu-plugin.h is part of the QEMU source tree.  Its public header includes
+# glib.h even though this diagnostic plugin itself does not use GLib APIs.
+QEMU_PLUGIN_CFLAGS ?= -I'$(QEMU_SOURCE_DIR)/include/qemu' $(shell pkg-config --cflags glib-2.0 2>/dev/null)
+QEMU_PLUGIN_LDFLAGS ?= -shared -fPIC
 QEMU_MKSD := $(QEMU_DIR)/build/mksf2000sd
 # The SF2000 kernel is built for MIPS32r1 but deliberately uses MIPS32r2 CP0
 # features (IntCtl/EBase select-1, ehb) in per_cpu_trap_init(); the 4Km model
@@ -451,6 +458,7 @@ QPSX_REAL_CORE_DEP ?= qpsx-mips32r1-audit
 QPSX_BENCHMARK_SD_TARGET ?= qpsx-no-menu-test-sd
 QPSX_BENCHMARK_ASD_TARGET ?= linux-full-asd
 QPSX_BENCHMARK_SECONDS ?= 25
+QPSX_BENCHMARK_BOOT_SECONDS ?= 5
 SDCARD_QPSX_STARTUP_CONFIG := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg
 SDCARD_QPSX_STARTUP_CHECKSUM := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg.sha256
 FRONTEND_LIFECYCLE_TEST_SD := $(BUILD_DIR)/frontend-lifecycle-test.sd.img
@@ -478,6 +486,22 @@ QEMU_CONTRACT_LOG ?= $(BUILD_DIR)/logs/linux-full-display.log
 QEMU_BENCH_SECONDS ?= 15
 QEMU_DISPLAY_ARGS ?=
 QEMU_FIDELITY_ARGS ?= -icount shift=1,sleep=on,align=on
+# Optional arguments are intentionally separate from QEMU_FIDELITY_ARGS:
+# cache/instruction measurements must not silently change normal smoke tests.
+QEMU_PERF_ARGS ?=
+QEMU_PLUGIN_ARGS ?=
+QEMU_CACHE_MODEL_SIZE ?= 16384
+QEMU_CACHE_MODEL_LINE ?= 16
+QEMU_CACHE_MODEL_WAYS ?= 2
+QEMU_CACHE_MODEL_DMODE ?= vipt
+QEMU_CACHE_MODEL_IMODE ?= vipt
+QEMU_CACHE_MODEL_PHASE ?= rec
+QEMU_CACHE_MODEL_SAMPLE ?= 10000000
+QEMU_CACHE_MODEL_IPENALTY ?= 8
+QEMU_CACHE_MODEL_DPENALTY ?= 12
+QEMU_CACHE_MODEL_LABEL ?= qpsx
+QEMU_CACHE_MODEL_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-model.log
+QEMU_CACHE_MODEL_HOT_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-hotspots.log
 GE_VENDOR_ARCHIVE ?= $(HCRTOS_SDK_DIR)/lib/vendor/libge.a
 GE_REVERSE_DIR := $(BUILD_DIR)/reverse-ge
 GE_NODE_TEST := $(BUILD_DIR)/hcge-node-test
@@ -549,11 +573,13 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	qpsx-dev-real-test-sd qpsx-dev-no-menu-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
 	benchmark-linux-qpsx-attract-dev \
+	benchmark-linux-qpsx-cache-model-fast \
 	qpsx-no-menu-physical \
 	gpsp-smc-test-roms run-linux-gpsp-smc smoke-linux-gpsp-smc \
 	run-linux-frontend-lifecycle smoke-linux-frontend-lifecycle \
 	run-linux-full-input smoke-linux-full-input \
 	metrics-linux metrics-frontend metrics-qemu-fidelity benchmark-qemu-linux \
+	qemu-cache-plugin benchmark-linux-qpsx-cache-model \
 	run-linux-full-fidelity smoke-linux-full-fidelity \
 	smoke-linux-physical-contract metrics-qemu-timing \
 	run-linux-reboot smoke-linux-reboot run-linux-full-reboot \
@@ -984,6 +1010,14 @@ test-ge-custom-keys: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 
 qemu:
 	$(MAKE) -C '$(QEMU_DIR)' build
+
+$(QEMU_CACHE_PLUGIN): $(QEMU_CACHE_PLUGIN_SRC) qemu
+	mkdir -p '$(dir $@)'
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -fvisibility=hidden \
+		$(QEMU_PLUGIN_CFLAGS) $(QEMU_PLUGIN_LDFLAGS) -o '$@' '$<'
+
+qemu-cache-plugin: $(QEMU_CACHE_PLUGIN)
+	@printf 'QEMU cache model plugin: %s\n' '$(QEMU_CACHE_PLUGIN)'
 
 $(QEMU_MKSD): $(QEMU_DIR)/tools/mksf2000sd.c
 	$(MAKE) -C '$(QEMU_DIR)' build/mksf2000sd
@@ -3219,12 +3253,13 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 	# key is pressed so Ridge Racer's attract sequence (title, menu, demo
 	# race) runs unkeyed and deterministically on the emulated frame
 	# timeline -- an in-game press would perturb the scene under test.
-	(sleep 5; printf 'sendkey x 100\n'; sleep 1; \
+	(sleep '$(QPSX_BENCHMARK_BOOT_SECONDS)'; printf 'sendkey x 100\n'; sleep 1; \
 		printf 'sendkey down 100\n'; sleep 1; \
 		printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
 		sleep '$(QPSX_BENCHMARK_SECONDS)'; \
 		printf 'quit\n') | \
 		SF2000_SCANOUT_ORACLE=0 '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
+		$(QEMU_PERF_ARGS) $(QEMU_PLUGIN_ARGS) \
 		-kernel '$(BUILD_DIR)'/sf2000-linux-full.asd \
 		-drive if=none,id=sd0,file='$(QPSX_REAL_TEST_SD)',format=raw \
 		-display none -serial none -monitor stdio \
@@ -3251,6 +3286,58 @@ benchmark-linux-qpsx-attract-dev:
 	$(MAKE) benchmark-linux-qpsx-attract \
 		QPSX_BENCHMARK_SD_TARGET=qpsx-dev-no-menu-test-sd \
 		QPSX_BENCHMARK_ASD_TARGET=linux-full-test-asd
+
+QEMU_CACHE_MODEL_SECONDS ?= 30
+QEMU_CACHE_MODEL_BOOT_SECONDS ?= 30
+QEMU_CACHE_MODEL_QEMU_ARGS ?=
+QEMU_CACHE_MODEL_ASD_TARGET ?= linux-full-test-asd
+QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
+
+# Run the same no-input Ridge Racer attract workload with the diagnostic
+# plugin.  The plugin's output is cumulative and periodically flushed, so the
+# final sample remains available even when the monitor sends `quit` before
+# QEMU's normal plugin-exit callback runs.  Vary SIZE/LINE/WAYS for a profile
+# sweep; the default is the 16-KiB, 2-way, 16-byte-line VIPT profile reported
+# by physical SF2000/GB300 kernel logs. QEMU's stock 24Kc CP0 currently reports
+# 2 KiB, so pass QEMU_CACHE_MODEL_SIZE=2048 to model that QEMU mismatch.
+benchmark-linux-qpsx-cache-model: qemu-cache-plugin
+	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
+	: > '$(QEMU_CACHE_MODEL_LOG)'
+	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	$(MAKE) run-linux-qpsx-attract-benchmark \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1' \
+		QPSX_BENCHMARK_ASD_TARGET='$(QEMU_CACHE_MODEL_ASD_TARGET)' \
+		QPSX_BENCHMARK_SD_TARGET='$(QEMU_CACHE_MODEL_SD_TARGET)' \
+		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
+		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
+		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+	test -s '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	@tail -n 5 '$(QEMU_CACHE_MODEL_LOG)'
+	@test -s '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	@sed -n '1,12p' '$(QEMU_CACHE_MODEL_HOT_LOG)'
+
+# Fast iteration variant.  It deliberately has no ASD/SD build prerequisites:
+# prepare the no-menu image and uncapped ASD once, then sweep cache profiles or
+# core binaries without paying the image/kernel build cost on every run.
+benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
+	test -s '$(BUILD_DIR)/sf2000-linux-full.asd'
+	test -s '$(QPSX_REAL_TEST_SD)'
+	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
+		grep -q '^menu_at_start=0$$'
+	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
+	: > '$(QEMU_CACHE_MODEL_LOG)'
+	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	$(MAKE) --no-print-directory run-linux-qpsx-attract-benchmark \
+		QPSX_BENCHMARK_ASD_TARGET= QPSX_BENCHMARK_SD_TARGET= \
+		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
+		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
+		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=0x80800000,recsize=0x800000,hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+	test -s '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	@tail -n 3 '$(QEMU_CACHE_MODEL_LOG)'
 
 run-linux-gpsp-smc: gpsp-smc-test-roms
 	@case ' $(GPSP_SMC_TEST_MODES) ' in \
