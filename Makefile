@@ -3557,6 +3557,8 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
 	awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' '$(QEMU_CACHE_MODEL_LOG)'
+	! grep -Fq 'sf2000-cache-model: translation userdata cleanup mismatch' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.console'
 	@set -eu; \
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
@@ -3635,6 +3637,8 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
 	awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' '$(QEMU_CACHE_MODEL_LOG)'
+	! grep -Fq 'sf2000-cache-model: translation userdata cleanup mismatch' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.console'
 	@set -eu; \
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \

@@ -1908,10 +1908,10 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             }
             data->class_id[index] = (unsigned char)classify_mips32(opcode);
         }
-        {
+        if (pc_is_selected(data->pc[index])) {
             MemData *mem = calloc(1, sizeof(*mem));
 
-            if (mem && pc_is_selected(data->pc[index])) {
+            if (mem) {
                 mem->pc = data->pc[index];
                 mem->gte_id = data->gte_id[index];
                 if (data->hot) {
@@ -1925,11 +1925,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 data->mem[index] = mem;
                 model.memdata_count++;
                 mem_userdata = mem;
-            } else if (mem) {
-                free(mem);
             }
-        }
-        if (pc_is_selected(data->pc[index])) {
             qemu_plugin_register_vcpu_mem_cb(insn, mem_access,
                                              QEMU_PLUGIN_CB_NO_REGS,
                                              QEMU_PLUGIN_MEM_RW, mem_userdata);
