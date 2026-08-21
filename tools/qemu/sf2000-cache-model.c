@@ -21,6 +21,11 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
+/* Bump this whenever the machine-readable report fields change.  The report
+ * checker in tools/qemu/check-cache-model-report.awk deliberately accepts only
+ * this schema so a positional printf edit cannot silently poison comparisons. */
+#define CACHE_MODEL_REPORT_VERSION 14
+
 typedef struct {
     uint64_t *tags;
     uint32_t *ages;
@@ -140,20 +145,25 @@ static size_t gte_range_count;
 #define GTE_ID_NONE 0
 #define GTE_ID_ENTRY 0x80
 
-typedef struct {
+typedef struct MemData MemData;
+typedef struct TranslationBlock TranslationBlock;
+
+struct TranslationBlock {
     uint64_t *pc;
     unsigned char *class_id;
     unsigned char *gte_id;
     HotspotEntry **hot;
+    MemData **mem;
     size_t count;
     size_t rec_count;
-} TranslationBlock;
+    TranslationBlock *next;
+};
 
-typedef struct {
+struct MemData {
     HotspotEntry *hot;
     uint64_t pc;
     unsigned char gte_id;
-} MemData;
+};
 
 typedef struct {
     Cache icache;
@@ -184,9 +194,14 @@ typedef struct {
     uint64_t insn_classes[INSN_CLASS_COUNT];
     uint64_t rec_base;
     uint64_t rec_end;
+    uint64_t rec_configured_base;
+    uint64_t rec_base_evidence_pc;
     uint64_t core_base;
     uint64_t core_end;
     int rec_base_auto;
+    int rec_base_was_auto;
+    int rec_base_discovered;
+    int rec_base_mismatch;
     int gte_enabled;
     uint64_t gte_map_hits;
     uint64_t gte_entries;
@@ -239,6 +254,9 @@ typedef struct {
     HotspotEntry *hot_table;
     size_t hot_capacity;
     char hot_path[PATH_MAX];
+    TranslationBlock *translation_blocks;
+    uint64_t translation_block_count;
+    uint64_t memdata_count;
 } Model;
 
 static Model model;
@@ -381,6 +399,83 @@ static const char *coverage_label(void)
     return model.rec_only ? "rec-only" : "post-rec-late";
 }
 
+static const char *rec_base_status(void)
+{
+    if (model.rec_base_mismatch) {
+        return "mismatch";
+    }
+    if (!model.rec_base_evidence_pc) {
+        return "no-evidence";
+    }
+    if (model.rec_base_was_auto) {
+        return "auto-first-rec-tb";
+    }
+    return "configured-validated";
+}
+
+static void rec_base_mismatch(const char *reason, uint64_t pc)
+{
+    if (!model.rec_base_mismatch) {
+        fprintf(stderr,
+                "sf2000-cache-model: recbase mismatch (%s) pc=0x%016" PRIx64
+                " configured=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+                reason, pc, model.rec_base,
+                model.rec_end - model.rec_base);
+    }
+    model.rec_base_mismatch = 1;
+}
+
+/* The QPSX Linux recompiler initializes recMem to the first emitted block and
+ * then executes that block.  In auto mode the first executable TB in the
+ * dedicated 0x832xxxxx allocator window is therefore stronger runtime
+ * evidence than a guessed 1 MiB alignment.  Keep the broad window only as a
+ * discovery guard; after the first TB, classify using the exact observed PC.
+ * Explicit recbase= values remain authoritative and are checked against the
+ * same runtime evidence. */
+#define REC_DISCOVERY_BASE UINT64_C(0x83200000)
+#define REC_DISCOVERY_END  UINT64_C(0x84000000)
+
+static void rec_base_observe(uint64_t pc)
+{
+    if (!model.rec_base_evidence_pc) {
+        model.rec_base_evidence_pc = pc;
+        model.rec_base_discovered = 1;
+        if (model.rec_base_was_auto) {
+            uint64_t size = model.rec_end - model.rec_base;
+
+            if ((pc & UINT64_C(3)) != 0 ||
+                pc < REC_DISCOVERY_BASE || pc >= REC_DISCOVERY_END ||
+                pc > UINT64_MAX - size) {
+                rec_base_mismatch("invalid first executable TB", pc);
+            } else {
+                model.rec_base = pc;
+                model.rec_end = pc + size;
+                model.rec_base_auto = 0;
+            }
+        } else if (pc < model.rec_base || pc >= model.rec_end) {
+            rec_base_mismatch("first executable TB outside configured range",
+                              pc);
+        }
+    } else if (pc < model.rec_base || pc >= model.rec_end) {
+        rec_base_mismatch("executable TB outside selected range", pc);
+    }
+}
+
+static uint64_t first_rec_candidate(struct qemu_plugin_tb *tb)
+{
+    size_t index;
+
+    for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
+        uint64_t pc = qemu_plugin_insn_vaddr(insn);
+
+        if (pc >= REC_DISCOVERY_BASE && pc < REC_DISCOVERY_END) {
+            return pc;
+        }
+    }
+    return 0;
+}
+
 static const char *gte_map_status(void)
 {
     if (!model.gte_enabled) {
@@ -409,6 +504,7 @@ static void rec_code_observe(uint64_t pc)
     if (!pc_is_rec_code(pc)) {
         return;
     }
+    rec_base_observe(pc);
     if (model.rec_pc_low == UINT64_MAX || pc < model.rec_pc_low) {
         model.rec_pc_low = pc;
     }
@@ -971,6 +1067,56 @@ static void clear_hotspot_counts(void)
     }
 }
 
+/* QEMU keeps plugin callback userdata live for the lifetime of the translated
+ * block.  The atexit callback is invoked after execution has stopped, so this
+ * is the first point at which it is safe to reclaim TranslationBlock and
+ * MemData records.  Never free these records during TB translation or flush:
+ * QEMU may still have callback references to them. */
+static void free_translation_blocks(void)
+{
+    TranslationBlock *block = model.translation_blocks;
+    uint64_t expected_blocks = model.translation_block_count;
+    uint64_t expected_memdata = model.memdata_count;
+    uint64_t freed_blocks = 0;
+    uint64_t freed_memdata = 0;
+
+    while (block) {
+        TranslationBlock *next = block->next;
+        size_t index;
+
+        if (block->mem) {
+            for (index = 0; index < block->count; index++) {
+                if (block->mem[index]) {
+                    free(block->mem[index]);
+                    freed_memdata++;
+                }
+            }
+        }
+        free(block->mem);
+        free(block->pc);
+        free(block->class_id);
+        free(block->gte_id);
+        free(block->hot);
+        free(block);
+        block = next;
+        freed_blocks++;
+    }
+    model.translation_blocks = NULL;
+    model.translation_block_count = 0;
+    model.memdata_count = 0;
+    if (freed_blocks != expected_blocks || freed_memdata != expected_memdata) {
+        fprintf(stderr,
+                "sf2000-cache-model: translation userdata cleanup mismatch "
+                "blocks=%" PRIu64 "/%" PRIu64 " memdata=%" PRIu64 "/%" PRIu64
+                "\n",
+                freed_blocks, expected_blocks, freed_memdata,
+                expected_memdata);
+    }
+    fprintf(stderr,
+            "sf2000-cache-model: released translation userdata blocks=%" PRIu64
+            " memdata=%" PRIu64 "\n", freed_blocks, freed_memdata);
+}
+
 static void write_hotspots(const char *kind)
 {
     HotspotEntry *top[32] = { 0 };
@@ -1011,10 +1157,10 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=13 sample=%" PRIu64
+            "# sf2000-cache-model hotspots version=%d sample=%" PRIu64
             " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
             " frame=%" PRIu64 " label=%s\n",
-            model.sample_no, kind, model.instructions,
+            CACHE_MODEL_REPORT_VERSION, model.sample_no, kind, model.instructions,
             scope_label(),
             coverage_label(), model.frame_number, model.label);
     for (rank = 0; rank < sizeof(top) / sizeof(top[0]); rank++) {
@@ -1163,6 +1309,8 @@ static void write_report(const char *kind)
     fprintf(model.out,
             "sample=%" PRIu64 " kind=%s label=%s instructions=%" PRIu64
             " scope=%s coverage=%s recbase=0x%016" PRIx64
+            " recbase_configured=0x%016" PRIx64
+            " recbase_status=%s recbase_evidence_pc=0x%016" PRIx64
             " frame=%" PRIu64 " frame_samples=%zu"
             " frame_avg_cycles=%" PRIu64
             " frame_p95_cycles=%" PRIu64
@@ -1212,26 +1360,22 @@ static void write_report(const char *kind)
             " rec_d_size1=%" PRIu64 " rec_d_size2=%" PRIu64
             " rec_d_size4=%" PRIu64 " rec_d_size8p=%" PRIu64
             " rec_d_misses=%" PRIu64
-            " core_instructions=%" PRIu64
-            " core_i_accesses=%" PRIu64 " core_i_misses=%" PRIu64
-            " core_d_accesses=%" PRIu64 " core_d_misses=%" PRIu64
-            " native_instructions=%" PRIu64
-            " native_d_accesses=%" PRIu64 " native_d_lines=%" PRIu64
-            " native_d_bytes=%" PRIu64 " native_d_size1=%" PRIu64
-            " native_d_size2=%" PRIu64 " native_d_size4=%" PRIu64
-            " native_d_size8p=%" PRIu64
-            " native_d_misses=%" PRIu64
+            " helper_instructions=%" PRIu64
             " helper_i_accesses=%" PRIu64 " helper_i_misses=%" PRIu64
             " helper_i_miss_ppm=%" PRIu64 " helper_i_miss_share_ppm=%" PRIu64
             " helper_d_accesses=%" PRIu64 " helper_d_lines=%" PRIu64
-            " helper_d_misses=%" PRIu64 " helper_d_miss_ppm=%" PRIu64
+            " helper_d_bytes=%" PRIu64 " helper_d_size1=%" PRIu64
+            " helper_d_size2=%" PRIu64 " helper_d_size4=%" PRIu64
+            " helper_d_size8p=%" PRIu64 " helper_d_misses=%" PRIu64
+            " helper_d_miss_ppm=%" PRIu64
             " helper_d_miss_share_ppm=%" PRIu64
             " est_cycles=%" PRIu64 " delta_instructions=%" PRIu64
             " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64
             " delta_est_cycles=%" PRIu64 "\n",
             model.sample_no, kind, model.label, model.instructions,
             scope_label(),
-            coverage_label(), model.rec_base,
+            coverage_label(), model.rec_base, model.rec_configured_base,
+            rec_base_status(), model.rec_base_evidence_pc,
             model.frame_number, model.frame_cycle_count,
             frame_average_cycles, frame_p95_cycles, frame_p98_cycles,
             frame_p99_cycles, frame_p999_cycles, frame_max_cycles,
@@ -1269,17 +1413,13 @@ static void write_report(const char *kind)
             model.rec_d_size_counts[0], model.rec_d_size_counts[1],
             model.rec_d_size_counts[2], model.rec_d_size_counts[3],
             model.rec_d_misses,
-            helper_instructions, helper_i_accesses, helper_i_misses,
-            helper_d_accesses, helper_d_misses,
             helper_instructions,
-            helper_d_accesses, helper_d_lines, helper_d_bytes,
-            helper_d_size_counts[0], helper_d_size_counts[1],
-            helper_d_size_counts[2], helper_d_size_counts[3],
-            helper_d_misses,
             helper_i_accesses, helper_i_misses,
             ratio_ppm(helper_i_misses, helper_i_accesses),
             ratio_ppm(helper_i_misses, model.i_misses),
-            helper_d_accesses, helper_d_lines, helper_d_misses,
+            helper_d_accesses, helper_d_lines, helper_d_bytes,
+            helper_d_size_counts[0], helper_d_size_counts[1],
+            helper_d_size_counts[2], helper_d_size_counts[3], helper_d_misses,
             ratio_ppm(helper_d_misses, helper_d_lines),
             ratio_ppm(helper_d_misses, model.d_misses),
             estimated_cycles, delta_instructions, delta_i_misses,
@@ -1624,24 +1764,25 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     size_t rec_count = 0;
     size_t core_count = 0;
 
-    /* "auto" is a layout detector, not merely an alias for the historical
-     * 0x83200000 constant.  Static-link changes can move recMem by a few
-     * pages; identify the first executable block in the known recMem 0x832
-     * MiB allocator window and align its address to the 1 MiB boundary before
-     * deciding whether this TB belongs to the rec phase. */
-    if (model.phase_rec && !model.phase_active && model.rec_base_auto) {
-        for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
-            struct qemu_plugin_insn *insn =
-                qemu_plugin_tb_get_insn(tb, index);
-            uint64_t pc = qemu_plugin_insn_vaddr(insn);
+    /* Before the first rec TB, validate the configured range against runtime
+     * executable evidence.  Auto mode adopts the exact first TB address; an
+     * explicit range must contain it.  A mismatch is retained in the report
+     * and printed to stderr, rather than silently attributing unrelated text
+     * to recRAM. */
+    if (model.phase_rec && !model.phase_active) {
+        uint64_t candidate = first_rec_candidate(tb);
 
-            if (pc >= UINT64_C(0x83200000) &&
-                pc < UINT64_C(0x83300000)) {
-                uint64_t rec_size = model.rec_end - model.rec_base;
-
-                model.rec_base = pc & ~UINT64_C(0x000fffff);
-                model.rec_end = model.rec_base + rec_size;
-                break;
+        if (candidate) {
+            if (model.rec_base_was_auto) {
+                rec_base_observe(candidate);
+            } else if (candidate < model.rec_base ||
+                       candidate >= model.rec_end) {
+                model.rec_base_evidence_pc = candidate;
+                model.rec_base_discovered = 1;
+                rec_base_mismatch("first executable TB outside configured range",
+                                  candidate);
+            } else {
+                rec_base_observe(candidate);
             }
         }
     }
@@ -1736,6 +1877,15 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             return;
         }
     }
+    data->mem = calloc(data->count, sizeof(*data->mem));
+    if (!data->mem) {
+        free(data->hot);
+        free(data->pc);
+        free(data->class_id);
+        free(data->gte_id);
+        free(data);
+        return;
+    }
     for (index = 0; index < data->count; index++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
         void *mem_userdata = &model;
@@ -1772,6 +1922,8 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                     }
                     mem->hot = data->hot[index];
                 }
+                data->mem[index] = mem;
+                model.memdata_count++;
                 mem_userdata = mem;
             } else if (mem) {
                 free(mem);
@@ -1788,6 +1940,9 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 insn, frame_marker_exec, QEMU_PLUGIN_CB_NO_REGS, NULL);
         }
     }
+    data->next = model.translation_blocks;
+    model.translation_blocks = data;
+    model.translation_block_count++;
     qemu_plugin_register_vcpu_tb_exec_cb(tb, tb_exec,
                                          QEMU_PLUGIN_CB_NO_REGS, data);
     (void)id;
@@ -1816,6 +1971,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         fclose(model.out);
         model.out = NULL;
     }
+    free_translation_blocks();
 }
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
@@ -1975,9 +2131,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     model.rec_base = rec_base;
     model.rec_end = rec_base + rec_size;
+    model.rec_configured_base = rec_base;
     model.core_base = core_base;
     model.core_end = core_base + core_size;
     model.rec_base_auto = rec_base_auto;
+    model.rec_base_was_auto = rec_base_auto;
+    model.rec_base_discovered = 0;
+    model.rec_base_mismatch = 0;
+    model.rec_base_evidence_pc = 0;
     if (model.gte_map_path[0] && load_gte_map(model.gte_map_path) != 0) {
         cache_destroy(&model.icache);
         cache_destroy(&model.dcache);
@@ -2024,10 +2185,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=13 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=%d target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
+            " recbase_configured=0x%016" PRIx64
             " recbase_mode=%s recsize=0x%016" PRIx64
             " imode=%s phase=%s scope=%s corebase=0x%016" PRIx64
             " coresize=0x%016" PRIx64
@@ -2035,10 +2197,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             " framereport=%" PRIu64 " framestop=%" PRIu64
             " coverage=%s gte_map=%s gte_map_entries=%" PRIu64
             " gte_core_sha256=%s\n",
+            CACHE_MODEL_REPORT_VERSION,
             info->target_name ? info->target_name : "unknown", size, line,
             ways, model.sample, model.instruction_penalty, model.data_penalty,
             model.d_vipt ? "vipt" : "pipt", model.d_vipt ? "vipt" : "phys",
-            rec_base, rec_base_auto ? "auto" : "exact", rec_size,
+            rec_base, model.rec_configured_base,
+            rec_base_auto ? "auto-first-rec-tb" : "configured", rec_size,
             model.i_vipt ? "vipt" : "pipt",
             model.phase_rec ? "rec" : "boot", scope_label(),
             model.core_base, model.core_end - model.core_base,

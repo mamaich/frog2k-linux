@@ -17,6 +17,9 @@ INITRAMFS_EPOCH ?= 0
 QEMU_BIN ?= $(QEMU_WORK)/qemu-$(QEMU_VERSION)/build/qemu-system-mipsel
 QEMU_CACHE_PLUGIN_SRC := tools/qemu/sf2000-cache-model.c
 QEMU_CACHE_PLUGIN := $(BUILD_DIR)/qemu/sf2000-cache-model.so
+QEMU_CACHE_MODEL_REPORT_CHECK := tools/qemu/check-cache-model-report.awk
+QEMU_CACHE_MODEL_REPORT_FIXTURE := tools/qemu/cache-model-report.sample
+QEMU_CACHE_MODEL_REPORT_INVALID_FIXTURE := tools/qemu/cache-model-report.invalid.sample
 # qemu-plugin.h is part of the QEMU source tree.  Its public header includes
 # glib.h even though this diagnostic plugin itself does not use GLib APIs.
 QEMU_PLUGIN_CFLAGS ?= -I'$(QEMU_SOURCE_DIR)/include/qemu' $(shell pkg-config --cflags glib-2.0 2>/dev/null)
@@ -637,6 +640,7 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
 	benchmark-linux-qpsx-attract-dev \
 	benchmark-linux-qpsx-cache-model-fast \
+	qemu-cache-model-report-schema-check qemu-cache-model-report-check \
 	qemu-cache-gte-map \
 	qpsx-cache-oracle-compare \
 	qpsx-no-menu-physical \
@@ -731,7 +735,28 @@ ci-fresh-js2300: $(USERSPACE_JS2300)
 	@printf 'fresh JS2300 userspace target passed: %s\n' '$(USERSPACE_JS2300)'
 
 check: audio-test efuse-test vdec-test vdec-codec-test dsc-test test-ge-node \
-	memory-layout-audit check-linux-early-handoff check-linux-cacheflush
+	memory-layout-audit check-linux-early-handoff check-linux-cacheflush \
+	qemu-cache-model-report-schema-check
+
+# Validate both the field schema and its accounting invariants.  The invalid
+# fixture deliberately changes d_bytes without changing either decomposition
+# operand; a positional printf argument drift therefore fails this check even
+# though every field still parses as a valid integer.
+qemu-cache-model-report-schema-check:
+	@awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' \
+		'$(QEMU_CACHE_MODEL_REPORT_FIXTURE)'
+	@if awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' \
+		'$(QEMU_CACHE_MODEL_REPORT_INVALID_FIXTURE)' >/dev/null 2>&1; then \
+		echo 'cache-model report check: invalid fixture unexpectedly passed' >&2; \
+		exit 1; \
+	else \
+		echo 'cache-model report check: invalid fixture rejected'; \
+	fi
+
+qemu-cache-model-report-check:
+	@test -s '$(QEMU_CACHE_MODEL_LOG)'
+	@awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' \
+		'$(QEMU_CACHE_MODEL_LOG)'
 
 check-linux-early-handoff:
 	grep -Fq 'sf2000_watchdog_arm("early-watchdog-armed")' $(LINUX_PATCHES)
@@ -3531,6 +3556,31 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	# correctness checks; requiring the racy third line rejects complete runs.
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
+	awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' '$(QEMU_CACHE_MODEL_LOG)'
+	@set -eu; \
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	reported_recbase=$$(sed -n 's/.*kind=frame .* recbase=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_status=$$(sed -n 's/.*kind=frame .* recbase_status=\([^ ]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_evidence=$$(sed -n 's/.*kind=frame .* recbase_evidence_pc=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	test -n "$$logged_recbase" -a -n "$$reported_recbase" \
+		-a -n "$$reported_status" -a -n "$$reported_evidence" || { \
+		echo 'QEMU model: missing recbase provenance in frame report' >&2; exit 2; }; \
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' = auto; then \
+		test "$$reported_status" = auto-first-rec-tb || { \
+			echo "QEMU model: auto recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_evidence))" || { \
+			echo "QEMU model: recMem=$$logged_recbase differs from evidence=$$reported_evidence" >&2; exit 2; }; \
+		test "$$((reported_recbase))" -eq "$$((reported_evidence))"; \
+	else \
+		test "$$reported_status" = configured-validated || { \
+			echo "QEMU model: configured recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_recbase))" || { \
+			echo "QEMU model: reported recbase=$$reported_recbase differs from recMem=$$logged_recbase" >&2; exit 2; }; \
+	fi
 	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
 		grep -Eq '^gte .*entries=[1-9][0-9]* .*map_status=ok ' \
 			'$(QEMU_CACHE_MODEL_LOG)' || { \
@@ -3584,6 +3634,31 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
+	awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' '$(QEMU_CACHE_MODEL_LOG)'
+	@set -eu; \
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	reported_recbase=$$(sed -n 's/.*kind=frame .* recbase=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_status=$$(sed -n 's/.*kind=frame .* recbase_status=\([^ ]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_evidence=$$(sed -n 's/.*kind=frame .* recbase_evidence_pc=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	test -n "$$logged_recbase" -a -n "$$reported_recbase" \
+		-a -n "$$reported_status" -a -n "$$reported_evidence" || { \
+		echo 'QEMU model: missing recbase provenance in frame report' >&2; exit 2; }; \
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' = auto; then \
+		test "$$reported_status" = auto-first-rec-tb || { \
+			echo "QEMU model: auto recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_evidence))" || { \
+			echo "QEMU model: recMem=$$logged_recbase differs from evidence=$$reported_evidence" >&2; exit 2; }; \
+		test "$$((reported_recbase))" -eq "$$((reported_evidence))"; \
+	else \
+		test "$$reported_status" = configured-validated || { \
+			echo "QEMU model: configured recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_recbase))" || { \
+			echo "QEMU model: reported recbase=$$reported_recbase differs from recMem=$$logged_recbase" >&2; exit 2; }; \
+	fi
 	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
 		grep -Eq '^gte .*entries=[1-9][0-9]* .*map_status=ok ' \
 			'$(QEMU_CACHE_MODEL_LOG)' || { \
