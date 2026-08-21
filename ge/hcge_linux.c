@@ -168,9 +168,24 @@ static uint32_t hcge_surface_buffer(HCGESurfacePixelFormat format,
 	uint32_t pitch)
 {
 	const struct hcge_format *description = hcge_get_format(format);
+	uint32_t context;
 
-	return description ? (uint32_t)description->code << 12 |
-		((pitch / description->bytes) & 0xfffu) : 0;
+	if (!description)
+		return 0;
+	/*
+	 * The HC15xx stores the 15-bit RGB/BGR distinction in the source
+	 * context's rgb_order field (bits 17..18), not in the five-bit color
+	 * format code.  The public vendor enum exposes RGB555 and BGR555, but
+	 * the vendor serializer emits the same code (4) for both and leaves the
+	 * order field at RGB.  PS1 VRAM is BGR555: red occupies bits 0..4 and
+	 * blue bits 10..14.  Set ORDER_BGR here so the GE performs the channel
+	 * interpretation while it converts/stretches the live VRAM surface.
+	 */
+	context = (uint32_t)description->code << 12 |
+		((pitch / description->bytes) & 0xfffu);
+	if (format == HCGE_DSPF_BGR555)
+		context |= 0x00020000u; /* rgb_order = ORDER_BGR */
+	return context;
 }
 
 static bool hcge_rectangle_valid(const HCGERectangle *rectangle)

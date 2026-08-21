@@ -955,17 +955,24 @@ test-ge-formats: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 	done; rm -f '$(BUILD_DIR)/.hcge-vendor-format'
 
 # The vendor serializer accepts BGR555 as a source (the PS1 VRAM layout), but
-# its destination/fill path traps for that format. Exercise the useful source
-# direction against the archive without pretending BGR555 is a valid paint
-# destination.
+# it emits the RGB555 order bit for that source.  The portable serializer must
+# add ORDER_BGR (context bit 17) so the GE interprets PS1 red/blue lanes
+# correctly.  Keep the vendor capture as evidence, then assert the intentional
+# context difference rather than treating the vendor's channel-order bug as a
+# parity golden.
 test-ge-source-formats: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 	set -e; HCGE_CAPTURE_SOURCE_FORMAT=9 \
 		qemu-mipsel '$(GE_VENDOR_CAPTURE)' 0 0 64 48 0 0 160 120 1 \
 		> '$(BUILD_DIR)/.hcge-vendor-source-format'; \
 	HCGE_CAPTURE_SOURCE_FORMAT=9 \
-		qemu-mipsel '$(GE_SOURCE_CAPTURE)' 0 0 64 48 0 0 160 120 1 | \
-		cmp - '$(BUILD_DIR)/.hcge-vendor-source-format'; \
-	rm -f '$(BUILD_DIR)/.hcge-vendor-source-format'
+		qemu-mipsel '$(GE_SOURCE_CAPTURE)' 0 0 64 48 0 0 160 120 1 \
+		> '$(BUILD_DIR)/.hcge-source-source-format'; \
+	test "$$(awk '$$1 == "blit-rgb16" { print $$10 }' \
+		'$(BUILD_DIR)/.hcge-source-source-format')" = 00024080; \
+	test "$$(awk '$$1 == "blit-rgb16" { print $$10 }' \
+		'$(BUILD_DIR)/.hcge-vendor-source-format')" = 00004080; \
+	rm -f '$(BUILD_DIR)/.hcge-vendor-source-format' \
+		'$(BUILD_DIR)/.hcge-source-source-format'
 
 test-ge-effects: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 	set -e; for flags in 0 1 2 3 4 5 6 7 8 16 24 32 64 128 512 1024 \

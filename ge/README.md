@@ -55,7 +55,12 @@ small no-MMU programs can pair `hcge_open_context()` with
 stretch nodes are
 byte-identical to the vendor library for ARGB1555, RGB565, XRGB8888, ARGB8888,
 ARGB4444, and RGB555; PS1-native BGR555 is supported as a source surface
-(the vendor destination path traps for that format). Cropped surfaces use
+(the vendor destination path traps for that format). RGB555/BGR555 share
+hardware color code 4, so BGR555 source contexts carry `ORDER_BGR` in bits
+17:18 (`0x00020000`). The surviving vendor serializer omits that bit; the
+Linux serializer sets it from the public BGR555 enum, which is why the source
+format differential test intentionally checks `00024080` locally versus the
+vendor's `00004080`. Cropped surfaces use
 validated physical-address views while
 retaining the hardware pitch. Drawing/blitting blend factors, color alpha,
 colorize, A8 source-mask alpha, all six vendor custom source/destination key
