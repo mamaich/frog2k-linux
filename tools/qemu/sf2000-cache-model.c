@@ -662,7 +662,7 @@ static void write_report(const char *kind)
     model.sample_no++;
     fprintf(model.out,
             "sample=%" PRIu64 " kind=%s label=%s instructions=%" PRIu64
-            " scope=%s coverage=%s"
+            " scope=%s coverage=%s recbase=0x%016" PRIx64
             " i_accesses=%" PRIu64 " i_misses=%" PRIu64
             " i_invalidations=%" PRIu64
             " d_accesses=%" PRIu64 " d_lines=%" PRIu64
@@ -706,7 +706,7 @@ static void write_report(const char *kind)
             " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64 "\n",
             model.sample_no, kind, model.label, model.instructions,
             model.rec_only ? "rec" : "all",
-            coverage_label(),
+            coverage_label(), model.rec_base,
             model.i_accesses, model.i_misses, model.i_invalidations,
             model.d_accesses,
             model.d_lines, model.d_bytes, model.d_size_counts[0],
@@ -948,8 +948,8 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* "auto" is a layout detector, not merely an alias for the historical
      * 0x83200000 constant.  Static-link changes can move recMem by a few
-     * pages; identify the first executable block in the reserved 0x82-0x84
-     * window and align its address to the 1 MiB allocator boundary before
+     * pages; identify the first executable block in the known recMem 0x832
+     * MiB allocator window and align its address to the 1 MiB boundary before
      * deciding whether this TB belongs to the rec phase. */
     if (model.phase_rec && !model.phase_active && model.rec_base_auto) {
         for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
@@ -957,8 +957,8 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 qemu_plugin_tb_get_insn(tb, index);
             uint64_t pc = qemu_plugin_insn_vaddr(insn);
 
-            if (pc >= UINT64_C(0x82000000) &&
-                pc < UINT64_C(0x84000000)) {
+            if (pc >= UINT64_C(0x83200000) &&
+                pc < UINT64_C(0x83300000)) {
                 uint64_t rec_size = model.rec_end - model.rec_base;
 
                 model.rec_base = pc & ~UINT64_C(0x000fffff);
