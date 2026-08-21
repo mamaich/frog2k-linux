@@ -82,6 +82,8 @@ typedef struct {
     uint64_t d_bytes;
     uint64_t d_size_counts[4];
     uint64_t d_misses;
+    uint64_t i_invalidations;
+    uint64_t rec_i_invalidations;
     uint64_t stores;
     uint64_t mmio;
     uint64_t sample;
@@ -231,6 +233,31 @@ static void rec_code_observe(uint64_t pc)
 static int cache_access(Cache *cache, uint64_t address);
 static int cache_access_indexed(Cache *cache, uint64_t tag_address,
                                 uint64_t index_address);
+
+/* A MIPS dynarec patches branch targets and emits new blocks with ordinary
+ * stores, followed by a small instruction-cache flush.  QEMU's plugin API
+ * does not expose the target cache instruction, but invalidating a matching
+ * I-cache line for a store into recMem is the conservative equivalent.  It
+ * prevents the model from crediting a stale native block after a backpatch. */
+static void cache_invalidate_indexed(Cache *cache, uint64_t tag_address,
+                                     uint64_t index_address)
+{
+    uint64_t tag_line = tag_address >> cache->line_shift;
+    uint64_t index_line = index_address >> cache->line_shift;
+    size_t set = (size_t)(index_line & (cache->sets - 1));
+    uint64_t tag = tag_line >> cache->set_shift;
+    size_t base = set * cache->ways;
+    size_t way;
+
+    for (way = 0; way < cache->ways; way++) {
+        size_t index = base + way;
+
+        if (cache->valid[index] && cache->tags[index] == tag) {
+            cache->valid[index] = 0;
+            cache->ages[index] = 0;
+        }
+    }
+}
 
 /* The guest plugin sees the Linux process' MIPS virtual addresses.  KSEG0
  * and KSEG1 are direct physical aliases on this NOMMU target.  QEMU normally
@@ -398,6 +425,8 @@ static void reset_measurement(void)
     model.d_bytes = 0;
     memset(model.d_size_counts, 0, sizeof(model.d_size_counts));
     model.d_misses = 0;
+    model.i_invalidations = 0;
+    model.rec_i_invalidations = 0;
     model.stores = 0;
     model.mmio = 0;
     model.sample_no = 0;
@@ -521,7 +550,7 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=9 sample=%" PRIu64
+            "# sf2000-cache-model hotspots version=10 sample=%" PRIu64
             " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
             " label=%s\n",
             model.sample_no, kind, model.instructions,
@@ -635,6 +664,7 @@ static void write_report(const char *kind)
             "sample=%" PRIu64 " kind=%s label=%s instructions=%" PRIu64
             " scope=%s coverage=%s"
             " i_accesses=%" PRIu64 " i_misses=%" PRIu64
+            " i_invalidations=%" PRIu64
             " d_accesses=%" PRIu64 " d_lines=%" PRIu64
             " d_bytes=%" PRIu64 " d_size1=%" PRIu64
             " d_size2=%" PRIu64 " d_size4=%" PRIu64
@@ -656,6 +686,7 @@ static void write_report(const char *kind)
             " rec_loads=%" PRIu64 " rec_store_insns=%" PRIu64
             " rec_muldiv=%" PRIu64 " rec_cop2=%" PRIu64
             " rec_i_accesses=%" PRIu64 " rec_i_misses=%" PRIu64
+            " rec_i_invalidations=%" PRIu64
             " rec_d_accesses=%" PRIu64 " rec_d_bytes=%" PRIu64
             " rec_d_size1=%" PRIu64 " rec_d_size2=%" PRIu64
             " rec_d_size4=%" PRIu64 " rec_d_size8p=%" PRIu64
@@ -676,7 +707,8 @@ static void write_report(const char *kind)
             model.sample_no, kind, model.label, model.instructions,
             model.rec_only ? "rec" : "all",
             coverage_label(),
-            model.i_accesses, model.i_misses, model.d_accesses,
+            model.i_accesses, model.i_misses, model.i_invalidations,
+            model.d_accesses,
             model.d_lines, model.d_bytes, model.d_size_counts[0],
             model.d_size_counts[1], model.d_size_counts[2],
             model.d_size_counts[3], model.d_misses, model.stores,
@@ -698,6 +730,7 @@ static void write_report(const char *kind)
             model.rec_insn_classes[INSN_MULDIV],
             model.rec_insn_classes[INSN_COP2],
             model.rec_i_accesses, model.rec_i_misses,
+            model.rec_i_invalidations,
             model.rec_d_accesses, model.rec_d_bytes,
             model.rec_d_size_counts[0], model.rec_d_size_counts[1],
             model.rec_d_size_counts[2], model.rec_d_size_counts[3],
@@ -795,6 +828,7 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     uint64_t last_address;
     uint64_t last_vaddr;
     unsigned int size_shift;
+    int rec_code_store;
 
     (void)vcpu_index;
     if (model.phase_rec && !model.phase_active) {
@@ -832,6 +866,8 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
             model.rec_d_size_counts[size_class]++;
         }
     }
+    rec_code_store = qemu_plugin_mem_is_store(info) &&
+                     pc_is_rec_code(vaddr);
     last_address = address + ((UINT64_C(1) << size_shift) - 1);
     last_vaddr = vaddr + ((UINT64_C(1) << size_shift) - 1);
     index_address = model.d_vipt ? vaddr : address;
@@ -888,6 +924,20 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
             }
         }
     }
+    if (rec_code_store) {
+        cache_invalidate_indexed(&model.icache, address, index_address);
+        model.i_invalidations++;
+        if (pc_is_rec_code(vaddr))
+            model.rec_i_invalidations++;
+        if ((last_address >> model.dcache.line_shift) !=
+            (address >> model.dcache.line_shift)) {
+            cache_invalidate_indexed(&model.icache, last_address,
+                                     last_index_address);
+            model.i_invalidations++;
+            if (pc_is_rec_code(last_vaddr))
+                model.rec_i_invalidations++;
+        }
+    }
 }
 
 static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
@@ -895,6 +945,28 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     TranslationBlock *data;
     size_t index;
     size_t rec_count = 0;
+
+    /* "auto" is a layout detector, not merely an alias for the historical
+     * 0x83200000 constant.  Static-link changes can move recMem by a few
+     * pages; identify the first executable block in the reserved 0x82-0x84
+     * window and align its address to the 1 MiB allocator boundary before
+     * deciding whether this TB belongs to the rec phase. */
+    if (model.phase_rec && !model.phase_active && model.rec_base_auto) {
+        for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
+            struct qemu_plugin_insn *insn =
+                qemu_plugin_tb_get_insn(tb, index);
+            uint64_t pc = qemu_plugin_insn_vaddr(insn);
+
+            if (pc >= UINT64_C(0x82000000) &&
+                pc < UINT64_C(0x84000000)) {
+                uint64_t rec_size = model.rec_end - model.rec_base;
+
+                model.rec_base = pc & ~UINT64_C(0x000fffff);
+                model.rec_end = model.rec_base + rec_size;
+                break;
+            }
+        }
+    }
 
     /* In rec-only mode the diagnostic is deliberately a generated-code
      * microscope.  Do not install a callback for every kernel/loader TB:
@@ -1183,7 +1255,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=9 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=10 target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
