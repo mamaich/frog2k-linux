@@ -459,6 +459,13 @@ QPSX_BENCHMARK_SD_TARGET ?= qpsx-no-menu-test-sd
 QPSX_BENCHMARK_ASD_TARGET ?= linux-full-asd
 QPSX_BENCHMARK_SECONDS ?= 25
 QPSX_BENCHMARK_BOOT_SECONDS ?= 5
+QPSX_BENCHMARK_FRAMES ?= 0
+# Fixed-frame diagnostics wait for the guest marker instead of guessing how
+# long a heavily instrumented QEMU run needs. A wall-clock timeout remains as
+# a failure bound when the guest never reaches the requested endpoint.
+QPSX_BENCHMARK_WAIT_FOR_FRAME ?= 1
+QPSX_BENCHMARK_CMDLINE = $(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 \
+	$(if $(filter-out 0,$(QPSX_BENCHMARK_FRAMES)),SF2000_BENCHMARK_FRAMES=$(QPSX_BENCHMARK_FRAMES),)
 SDCARD_QPSX_STARTUP_CONFIG := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg
 SDCARD_QPSX_STARTUP_CHECKSUM := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg.sha256
 FRONTEND_LIFECYCLE_TEST_SD := $(BUILD_DIR)/frontend-lifecycle-test.sd.img
@@ -496,10 +503,19 @@ QEMU_CACHE_MODEL_WAYS ?= 2
 QEMU_CACHE_MODEL_DMODE ?= vipt
 QEMU_CACHE_MODEL_IMODE ?= vipt
 QEMU_CACHE_MODEL_PHASE ?= rec
+# `rec` is the low-overhead generated-code microscope.  Use `all` with
+# phase=rec for a slower post-rec pass that includes recompiler helpers and
+# frontend-side instructions after the first recRAM block executes.
+QEMU_CACHE_MODEL_SCOPE ?= rec
 QEMU_CACHE_MODEL_SAMPLE ?= 10000000
 QEMU_CACHE_MODEL_IPENALTY ?= 8
 QEMU_CACHE_MODEL_DPENALTY ?= 12
 QEMU_CACHE_MODEL_LABEL ?= qpsx
+# recMem is printed by QPSX at startup; keep this default synchronized with
+# the current static-PIE layout and override it when a build logs another
+# address.  Using the old kernel-range default silently poisoned rec samples.
+QEMU_CACHE_MODEL_RECBASE ?= 0x83214f14
+QEMU_CACHE_MODEL_RECSIZE ?= 0x800000
 QEMU_CACHE_MODEL_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-model.log
 QEMU_CACHE_MODEL_HOT_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-hotspots.log
 GE_VENDOR_ARCHIVE ?= $(HCRTOS_SDK_DIR)/lib/vendor/libge.a
@@ -3239,6 +3255,7 @@ smoke-linux-qpsx-savestate: run-linux-qpsx-savestate
 # for absolute FPS because TCG does not model the HC15xx pipeline or caches.
 run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCHMARK_SD_TARGET)
 	mkdir -p '$(BUILD_DIR)'/logs
+	: > '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
 	# Launch the game from the browser, then press nothing: Ridge Racer's
 	# attract sequence advances to the demo race by itself.  Unthrottled
 	# execution comes from the SF2000_UNCAPPED=1 cmdline flag (the frontend
@@ -3256,7 +3273,18 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 	(sleep '$(QPSX_BENCHMARK_BOOT_SECONDS)'; printf 'sendkey x 100\n'; sleep 1; \
 		printf 'sendkey down 100\n'; sleep 1; \
 		printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
-		sleep '$(QPSX_BENCHMARK_SECONDS)'; \
+		if test '$(QPSX_BENCHMARK_WAIT_FOR_FRAME)' = 1 && \
+			test '$(QPSX_BENCHMARK_FRAMES)' -gt 0; then \
+			waited=0; \
+			while test "$$waited" -lt '$(QPSX_BENCHMARK_SECONDS)'; do \
+				if grep -Eq 'QPSX: retro_run progress: frame $(QPSX_BENCHMARK_FRAMES)$$' \
+					'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log; then break; fi; \
+				sleep 1; waited=$$((waited + 1)); \
+			done; \
+			sleep 1; \
+		else \
+			sleep '$(QPSX_BENCHMARK_SECONDS)'; \
+		fi; \
 		printf 'quit\n') | \
 		SF2000_SCANOUT_ORACLE=0 '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
 		$(QEMU_PERF_ARGS) $(QEMU_PLUGIN_ARGS) \
@@ -3269,7 +3297,7 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 
 benchmark-linux-qpsx-attract:
 	$(MAKE) run-linux-qpsx-attract-benchmark \
-		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1'
+		LINUX_CMDLINE='$(QPSX_BENCHMARK_CMDLINE)'
 	@awk '/QPSX: retro_run progress: frame (1200|1800)$$/ { \
 		line=$$0; sub(/^.*\[/, "", line); sub(/\].*$$/, "", line); \
 		time=line+0; frame=$$NF+0; if (frame == 1200) start=time; \
@@ -3289,6 +3317,7 @@ benchmark-linux-qpsx-attract-dev:
 
 QEMU_CACHE_MODEL_SECONDS ?= 30
 QEMU_CACHE_MODEL_BOOT_SECONDS ?= 30
+QEMU_CACHE_MODEL_FRAMES ?= 2700
 QEMU_CACHE_MODEL_QEMU_ARGS ?=
 QEMU_CACHE_MODEL_ASD_TARGET ?= linux-full-test-asd
 QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
@@ -3300,20 +3329,33 @@ QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
 # sweep; the default is the 16-KiB, 2-way, 16-byte-line VIPT profile reported
 # by physical SF2000/GB300 kernel logs. QEMU's stock 24Kc CP0 currently reports
 # 2 KiB, so pass QEMU_CACHE_MODEL_SIZE=2048 to model that QEMU mismatch.
+# The rec phase uses the address printed by `QPSX: rec address recMem=...`;
+# pass QEMU_CACHE_MODEL_RECBASE when the core's PIE layout changes.
 benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
 	: > '$(QEMU_CACHE_MODEL_LOG)'
 	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	$(MAKE) run-linux-qpsx-attract-benchmark \
-		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1' \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES)' \
+		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
 		QPSX_BENCHMARK_ASD_TARGET='$(QEMU_CACHE_MODEL_ASD_TARGET)' \
 		QPSX_BENCHMARK_SD_TARGET='$(QEMU_CACHE_MODEL_SD_TARGET)' \
 		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	test -n "$$logged_recbase" || { echo 'QEMU model: missing QPSX recMem fingerprint' >&2; exit 2; }; \
+	test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
+		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }
+	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	grep -q 'sf2000-frontend: benchmark frame limit reached' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	@tail -n 5 '$(QEMU_CACHE_MODEL_LOG)'
 	@test -s '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	@sed -n '1,12p' '$(QEMU_CACHE_MODEL_HOT_LOG)'
@@ -3324,6 +3366,10 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	test -s '$(BUILD_DIR)/sf2000-linux-full.asd'
 	test -s '$(QPSX_REAL_TEST_SD)'
+	$(if $(filter-out 0,$(QEMU_CACHE_MODEL_FRAMES)),\
+	$(MAKE) --no-print-directory ROOTFS=full SDCARD_ASD_SYNC=0 \
+		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES)' linux-full-test-asd,)
 	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
 		grep -q '^menu_at_start=0$$'
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
@@ -3331,12 +3377,24 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
 	$(MAKE) --no-print-directory run-linux-qpsx-attract-benchmark \
 		QPSX_BENCHMARK_ASD_TARGET= QPSX_BENCHMARK_SD_TARGET= \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES)' \
+		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
 		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=0x80800000,recsize=0x800000,hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	test -n "$$logged_recbase" || { echo 'QEMU model: missing QPSX recMem fingerprint' >&2; exit 2; }; \
+	test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
+		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }
+	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	grep -q 'sf2000-frontend: benchmark frame limit reached' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	@tail -n 3 '$(QEMU_CACHE_MODEL_LOG)'
 
 run-linux-gpsp-smc: gpsp-smc-test-roms

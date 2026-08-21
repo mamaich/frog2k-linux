@@ -33,10 +33,16 @@ typedef struct {
 
 typedef struct {
     uint64_t pc;
+    uint32_t opcode;
+    unsigned char class_id;
     uint64_t executions;
     uint64_t i_misses;
     uint64_t d_accesses;
     uint64_t d_misses;
+    uint64_t first_d_miss_address;
+    uint64_t last_d_miss_address;
+    uint64_t first_d_miss_vaddr;
+    uint64_t last_d_miss_vaddr;
 } HotspotEntry;
 
 enum InsnClass {
@@ -55,6 +61,7 @@ typedef struct {
     unsigned char *class_id;
     HotspotEntry **hot;
     size_t count;
+    size_t rec_count;
 } TranslationBlock;
 
 typedef struct {
@@ -89,9 +96,18 @@ typedef struct {
     uint64_t rec_i_accesses;
     uint64_t rec_i_misses;
     uint64_t rec_d_accesses;
+    uint64_t rec_d_lines;
     uint64_t rec_d_misses;
+    uint64_t rec_insn_classes[INSN_CLASS_COUNT];
+    uint64_t rec_tb_execs;
+    uint64_t rec_unique_lines;
+    uint64_t rec_pc_low;
+    uint64_t rec_pc_high;
+    unsigned char *rec_line_bits;
+    size_t rec_line_count;
     int d_vipt;
     int i_vipt;
+    int rec_only;
     int phase_rec;
     int phase_active;
     int have_previous;
@@ -162,6 +178,49 @@ static uint64_t ratio_ppm(uint64_t numerator, uint64_t denominator)
 static int pc_is_rec_code(uint64_t pc)
 {
     return pc >= model.rec_base && pc < model.rec_end;
+}
+
+static const char *coverage_label(void)
+{
+    if (!model.phase_rec) {
+        return "full";
+    }
+    return model.rec_only ? "rec-only" : "post-rec-late";
+}
+
+/* Keep a compact footprint of generated-code instruction lines.  The target
+ * has a 16-byte VIPT I-cache and an 8 MiB recRAM window, so the default bitmap
+ * is only 64 KiB.  This is deliberately separate from the cache tags: a line
+ * can be evicted and reloaded many times, while this counter answers the
+ * different question “how much generated code did the scene touch at all?”. */
+static void rec_code_observe(uint64_t pc)
+{
+    uint64_t line;
+    size_t byte;
+    unsigned char mask;
+
+    if (!pc_is_rec_code(pc)) {
+        return;
+    }
+    if (model.rec_pc_low == UINT64_MAX || pc < model.rec_pc_low) {
+        model.rec_pc_low = pc;
+    }
+    if (pc + 4 > model.rec_pc_high) {
+        model.rec_pc_high = pc + 4;
+    }
+    if (!model.rec_line_bits || model.rec_line_count == 0) {
+        return;
+    }
+    line = (pc - model.rec_base) >> model.icache.line_shift;
+    if (line >= model.rec_line_count) {
+        return;
+    }
+    byte = (size_t)(line >> 3);
+    mask = (unsigned char)(1u << (line & 7));
+    if (!(model.rec_line_bits[byte] & mask)) {
+        model.rec_line_bits[byte] |= mask;
+        model.rec_unique_lines++;
+    }
 }
 
 static int cache_access(Cache *cache, uint64_t address);
@@ -344,13 +403,27 @@ static void reset_measurement(void)
     model.rec_i_accesses = 0;
     model.rec_i_misses = 0;
     model.rec_d_accesses = 0;
+    model.rec_d_lines = 0;
     model.rec_d_misses = 0;
+    memset(model.rec_insn_classes, 0, sizeof(model.rec_insn_classes));
+    model.rec_tb_execs = 0;
+    model.rec_unique_lines = 0;
+    model.rec_pc_low = UINT64_MAX;
+    model.rec_pc_high = 0;
+    if (model.rec_line_bits && model.rec_line_count) {
+        memset(model.rec_line_bits, 0,
+               (model.rec_line_count + 7) / 8);
+    }
     if (model.hot_table) {
         for (index = 0; index < model.hot_capacity; index++) {
             model.hot_table[index].executions = 0;
             model.hot_table[index].i_misses = 0;
             model.hot_table[index].d_accesses = 0;
             model.hot_table[index].d_misses = 0;
+            model.hot_table[index].first_d_miss_address = 0;
+            model.hot_table[index].last_d_miss_address = 0;
+            model.hot_table[index].first_d_miss_vaddr = 0;
+            model.hot_table[index].last_d_miss_vaddr = 0;
         }
     }
 }
@@ -439,9 +512,12 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=3 sample=%" PRIu64
-            " kind=%s instructions=%" PRIu64 " label=%s\n",
-            model.sample_no, kind, model.instructions, model.label);
+            "# sf2000-cache-model hotspots version=6 sample=%" PRIu64
+            " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
+            " label=%s\n",
+            model.sample_no, kind, model.instructions,
+            model.rec_only ? "rec" : "all",
+            coverage_label(), model.label);
     for (rank = 0; rank < sizeof(top) / sizeof(top[0]); rank++) {
         HotspotEntry *entry = top[rank];
 
@@ -450,12 +526,19 @@ static void write_hotspots(const char *kind)
         }
         fprintf(out,
                 "hotspot sample=%" PRIu64 " rank=%zu pc=0x%016" PRIx64
+                " opcode=0x%08" PRIx32 " class=%u"
                 " executions=%" PRIu64 " i_misses=%" PRIu64
                 " d_accesses=%" PRIu64 " d_misses=%" PRIu64
+                " first_d_miss=0x%016" PRIx64 "/0x%016" PRIx64
+                " last_d_miss=0x%016" PRIx64 "/0x%016" PRIx64
                 " penalty=%" PRIu64 "\n",
-                model.sample_no, rank + 1, entry->pc, entry->executions,
+                model.sample_no, rank + 1, entry->pc, entry->opcode,
+                (unsigned)entry->class_id, entry->executions,
                 entry->i_misses,
-                entry->d_accesses, entry->d_misses, hotspot_penalty(entry));
+                entry->d_accesses, entry->d_misses,
+                entry->first_d_miss_address, entry->first_d_miss_vaddr,
+                entry->last_d_miss_address, entry->last_d_miss_vaddr,
+                hotspot_penalty(entry));
     }
     fflush(out);
     fclose(out);
@@ -470,6 +553,11 @@ static void write_report(const char *kind)
     uint64_t rec_d_ppm;
     uint64_t rec_i_miss_ppm;
     uint64_t rec_d_miss_ppm;
+    uint64_t rec_i_miss_share_ppm;
+    uint64_t rec_d_miss_share_ppm;
+    uint64_t rec_d_line_miss_ppm;
+    uint64_t rec_cf_ppm;
+    uint64_t rec_code_span;
     uint64_t delta_instructions;
     uint64_t delta_i_misses;
     uint64_t delta_d_misses;
@@ -486,6 +574,15 @@ static void write_report(const char *kind)
     rec_d_ppm = ratio_ppm(model.rec_d_accesses, model.d_accesses);
     rec_i_miss_ppm = ratio_ppm(model.rec_i_misses, model.rec_i_accesses);
     rec_d_miss_ppm = ratio_ppm(model.rec_d_misses, model.rec_d_accesses);
+    rec_i_miss_share_ppm = ratio_ppm(model.rec_i_misses, model.i_misses);
+    rec_d_miss_share_ppm = ratio_ppm(model.rec_d_misses, model.d_misses);
+    rec_d_line_miss_ppm = ratio_ppm(model.rec_d_misses, model.rec_d_lines);
+    rec_cf_ppm = ratio_ppm(model.rec_insn_classes[INSN_BRANCH] +
+                           model.rec_insn_classes[INSN_JUMP],
+                           model.rec_i_accesses);
+    rec_code_span = model.rec_pc_low == UINT64_MAX ||
+                    model.rec_pc_high < model.rec_pc_low ? 0 :
+                    model.rec_pc_high - model.rec_pc_low;
     if (model.have_previous) {
         delta_instructions = model.instructions - model.previous_instructions;
         delta_i_misses = model.i_misses - model.previous_i_misses;
@@ -498,27 +595,47 @@ static void write_report(const char *kind)
     model.sample_no++;
     fprintf(model.out,
             "sample=%" PRIu64 " kind=%s label=%s instructions=%" PRIu64
+            " scope=%s coverage=%s"
             " i_accesses=%" PRIu64 " i_misses=%" PRIu64
             " d_accesses=%" PRIu64 " d_lines=%" PRIu64
             " d_misses=%" PRIu64 " stores=%" PRIu64 " mmio=%" PRIu64
             " i_miss_ppm=%" PRIu64 " d_miss_ppm=%" PRIu64
             " rec_i_ppm=%" PRIu64 " rec_d_ppm=%" PRIu64
             " rec_i_miss_ppm=%" PRIu64 " rec_d_miss_ppm=%" PRIu64
+            " rec_i_miss_share_ppm=%" PRIu64
+            " rec_d_miss_share_ppm=%" PRIu64
+            " rec_d_lines=%" PRIu64 " rec_d_line_miss_ppm=%" PRIu64
+            " rec_cf_ppm=%" PRIu64 " rec_unique_lines=%" PRIu64
+            " rec_code_span=%" PRIu64 " rec_tb_execs=%" PRIu64
             " branches=%" PRIu64 " jumps=%" PRIu64
             " loads=%" PRIu64 " store_insns=%" PRIu64
             " muldiv=%" PRIu64 " cop2=%" PRIu64
+            " rec_branches=%" PRIu64 " rec_jumps=%" PRIu64
+            " rec_loads=%" PRIu64 " rec_store_insns=%" PRIu64
+            " rec_muldiv=%" PRIu64 " rec_cop2=%" PRIu64
             " rec_i_accesses=%" PRIu64 " rec_i_misses=%" PRIu64
             " rec_d_accesses=%" PRIu64 " rec_d_misses=%" PRIu64
             " est_cycles=%" PRIu64 " delta_instructions=%" PRIu64
             " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64 "\n",
             model.sample_no, kind, model.label, model.instructions,
+            model.rec_only ? "rec" : "all",
+            coverage_label(),
             model.i_accesses, model.i_misses, model.d_accesses,
             model.d_lines, model.d_misses, model.stores, model.mmio,
             i_miss_ppm, d_miss_ppm, rec_i_ppm, rec_d_ppm,
             rec_i_miss_ppm, rec_d_miss_ppm,
+            rec_i_miss_share_ppm, rec_d_miss_share_ppm,
+            model.rec_d_lines, rec_d_line_miss_ppm, rec_cf_ppm,
+            model.rec_unique_lines, rec_code_span, model.rec_tb_execs,
             model.insn_classes[INSN_BRANCH], model.insn_classes[INSN_JUMP],
             model.insn_classes[INSN_LOAD], model.insn_classes[INSN_STORE],
             model.insn_classes[INSN_MULDIV], model.insn_classes[INSN_COP2],
+            model.rec_insn_classes[INSN_BRANCH],
+            model.rec_insn_classes[INSN_JUMP],
+            model.rec_insn_classes[INSN_LOAD],
+            model.rec_insn_classes[INSN_STORE],
+            model.rec_insn_classes[INSN_MULDIV],
+            model.rec_insn_classes[INSN_COP2],
             model.rec_i_accesses, model.rec_i_misses,
             model.rec_d_accesses, model.rec_d_misses,
             estimated_cycles, delta_instructions, delta_i_misses,
@@ -546,22 +663,32 @@ static void tb_exec(unsigned int vcpu_index, void *userdata)
 {
     TranslationBlock *tb = userdata;
     size_t index;
+    int rec_tb_seen = 0;
 
     (void)vcpu_index;
+    /* During rec-phase setup, most TBs are kernel/loader code.  The previous
+     * implementation checked every instruction in each of those TBs, which
+     * made the diagnostic plugin slow the boot so much that it never reached
+     * QPSX.  Translation-time rec_count gives us an O(1) rejection path. */
+    if (model.phase_rec && !model.phase_active) {
+        if (tb->rec_count == 0) {
+            return;
+        }
+        reset_measurement();
+        model.phase_active = 1;
+    }
     for (index = 0; index < tb->count; index++) {
-        if (model.phase_rec && !model.phase_active) {
-            if (pc_is_rec_code(tb->pc[index])) {
-                reset_measurement();
-                model.phase_active = 1;
-            } else {
-                continue;
-            }
+        if (model.rec_only && !pc_is_rec_code(tb->pc[index])) {
+            continue;
         }
         model.instructions++;
         model.i_accesses++;
         model.insn_classes[tb->class_id[index]]++;
         if (pc_is_rec_code(tb->pc[index])) {
             model.rec_i_accesses++;
+            model.rec_insn_classes[tb->class_id[index]]++;
+            rec_tb_seen = 1;
+            rec_code_observe(tb->pc[index]);
         }
         if (tb->hot && tb->hot[index]) {
             tb->hot[index]->executions++;
@@ -575,6 +702,9 @@ static void tb_exec(unsigned int vcpu_index, void *userdata)
                 tb->hot[index]->i_misses++;
             }
         }
+    }
+    if (rec_tb_seen) {
+        model.rec_tb_execs++;
     }
     maybe_report();
 }
@@ -632,6 +762,9 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
         model.stores++;
     }
     model.d_lines++;
+    if (pc_is_rec_code(pc)) {
+        model.rec_d_lines++;
+    }
     if (!cache_access_indexed(&model.dcache, address, index_address)) {
         model.d_misses++;
         if (pc_is_rec_code(pc)) {
@@ -639,11 +772,20 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
         }
         if (hot) {
             hot->d_misses++;
+            if (!hot->first_d_miss_address) {
+                hot->first_d_miss_address = address;
+                hot->first_d_miss_vaddr = vaddr;
+            }
+            hot->last_d_miss_address = address;
+            hot->last_d_miss_vaddr = vaddr;
         }
     }
     if ((last_address >> model.dcache.line_shift) !=
         (address >> model.dcache.line_shift)) {
         model.d_lines++;
+        if (pc_is_rec_code(pc)) {
+            model.rec_d_lines++;
+        }
         if (!cache_access_indexed(&model.dcache, last_address,
                                   last_index_address)) {
             model.d_misses++;
@@ -652,6 +794,12 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
             }
             if (hot) {
                 hot->d_misses++;
+                if (!hot->first_d_miss_address) {
+                    hot->first_d_miss_address = last_address;
+                    hot->first_d_miss_vaddr = last_vaddr;
+                }
+                hot->last_d_miss_address = last_address;
+                hot->last_d_miss_vaddr = last_vaddr;
             }
         }
     }
@@ -661,12 +809,52 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     TranslationBlock *data;
     size_t index;
+    size_t rec_count = 0;
+
+    /* In rec-only mode the diagnostic is deliberately a generated-code
+     * microscope.  Do not install a callback for every kernel/loader TB:
+     * QEMU still translates those TBs, but the plugin no longer adds a
+     * per-TB execution callback and per-load/store callbacks before QPSX
+     * starts.  This makes a rec-phase run reach the game instead of spending
+     * its entire budget instrumenting Linux boot.
+     *
+     * The same early rejection is useful for a post-rec (scope=all) pass.
+     * A memory callback that merely returns while phase_active is false is
+     * still expensive enough to trip the guest watchdog during Linux boot.
+     * Skip those pre-rec TBs entirely; helpers translated after the first
+     * recRAM block are still measured, and the generated-code microscope is
+     * unchanged.  The report labels this as phase=rec so callers do not
+     * mistake it for a boot-inclusive profile. */
+    if (model.rec_only) {
+        for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
+
+            if (pc_is_rec_code(qemu_plugin_insn_vaddr(insn))) {
+                rec_count++;
+            }
+        }
+        if (rec_count == 0) {
+            return;
+        }
+    } else if (model.phase_rec) {
+        for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
+
+            if (pc_is_rec_code(qemu_plugin_insn_vaddr(insn))) {
+                rec_count++;
+            }
+        }
+        if (!model.phase_active && rec_count == 0) {
+            return;
+        }
+    }
 
     data = calloc(1, sizeof(*data));
     if (!data) {
         return;
     }
     data->count = qemu_plugin_tb_n_insns(tb);
+    data->rec_count = 0;
     data->pc = calloc(data->count, sizeof(*data->pc));
     data->class_id = calloc(data->count, sizeof(*data->class_id));
     if (!data->pc || !data->class_id) {
@@ -687,11 +875,14 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     for (index = 0; index < data->count; index++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
         void *mem_userdata = &model;
+        uint32_t opcode = 0;
 
         data->pc[index] = qemu_plugin_insn_vaddr(insn);
+        if (pc_is_rec_code(data->pc[index])) {
+            data->rec_count++;
+        }
         {
             unsigned char bytes[4] = { 0, 0, 0, 0 };
-            uint32_t opcode = 0;
 
             if (qemu_plugin_insn_data(insn, bytes, sizeof(bytes)) ==
                 sizeof(bytes)) {
@@ -705,18 +896,26 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         {
             MemData *mem = calloc(1, sizeof(*mem));
 
-            if (mem) {
+            if (mem && (!model.rec_only || pc_is_rec_code(data->pc[index]))) {
                 mem->pc = data->pc[index];
                 if (data->hot) {
                     data->hot[index] = hotspot_lookup(data->pc[index]);
+                    if (data->hot[index]) {
+                        data->hot[index]->opcode = opcode;
+                        data->hot[index]->class_id = data->class_id[index];
+                    }
                     mem->hot = data->hot[index];
                 }
                 mem_userdata = mem;
+            } else if (mem) {
+                free(mem);
             }
         }
-        qemu_plugin_register_vcpu_mem_cb(insn, mem_access,
-                                         QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_RW, mem_userdata);
+        if (!model.rec_only || pc_is_rec_code(data->pc[index])) {
+            qemu_plugin_register_vcpu_mem_cb(insn, mem_access,
+                                             QEMU_PLUGIN_CB_NO_REGS,
+                                             QEMU_PLUGIN_MEM_RW, mem_userdata);
+        }
     }
     qemu_plugin_register_vcpu_tb_exec_cb(tb, tb_exec,
                                          QEMU_PLUGIN_CB_NO_REGS, data);
@@ -730,6 +929,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
     write_report("exit");
     cache_destroy(&model.icache);
     cache_destroy(&model.dcache);
+    free(model.rec_line_bits);
+    model.rec_line_bits = NULL;
+    model.rec_line_count = 0;
     free(model.hot_table);
     model.hot_table = NULL;
     if (model.out) {
@@ -745,7 +947,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     uint64_t size = 16384;
     uint64_t line = 16;
     uint64_t ways = 2;
-    uint64_t rec_base = UINT64_C(0x80800000);
+    /* QPSX's Linux NOMMU PIE currently reports this recMem address in its
+     * startup fingerprint.  The old 0x80800000 default overlapped kernel
+     * text, producing convincing but completely wrong “rec” samples. */
+    uint64_t rec_base = UINT64_C(0x83214f14);
     uint64_t rec_size = UINT64_C(0x00800000);
     int index;
     const char *out_path = NULL;
@@ -755,6 +960,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     model.data_penalty = 12;
     model.d_vipt = 1;
     model.i_vipt = 1;
+    model.rec_only = 0;
     model.phase_rec = 0;
     model.phase_active = 1;
     snprintf(model.label, sizeof(model.label), "sf2000");
@@ -806,6 +1012,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 fprintf(stderr, "sf2000-cache-model: phase must be boot or rec\n");
                 return -1;
             }
+        } else if (key_length == 5 && strncmp(key, "scope", key_length) == 0) {
+            if (strcmp(value, "all") == 0) {
+                model.rec_only = 0;
+            } else if (strcmp(value, "rec") == 0) {
+                model.rec_only = 1;
+            } else {
+                fprintf(stderr, "sf2000-cache-model: scope must be all or rec\n");
+                return -1;
+            }
         } else if (key_length == 3 && strncmp(key, "out", key_length) == 0) {
             out_path = value;
         } else if (key_length == 5 && strncmp(key, "label", key_length) == 0) {
@@ -836,6 +1051,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     model.rec_base = rec_base;
     model.rec_end = rec_base + rec_size;
+    model.rec_line_count = (size_t)((rec_size + line - 1) / line);
+    if (model.rec_line_count > SIZE_MAX - 7 ||
+        !(model.rec_line_bits = calloc((model.rec_line_count + 7) / 8, 1))) {
+        fprintf(stderr, "sf2000-cache-model: rec footprint allocation failed\n");
+        cache_destroy(&model.icache);
+        cache_destroy(&model.dcache);
+        return -1;
+    }
+    model.rec_pc_low = UINT64_MAX;
     if (model.hot_path[0]) {
         model.hot_capacity = 65536;
         model.hot_table = calloc(model.hot_capacity, sizeof(*model.hot_table));
@@ -843,6 +1067,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             fprintf(stderr, "sf2000-cache-model: hotspot table allocation failed\n");
             cache_destroy(&model.icache);
             cache_destroy(&model.dcache);
+            free(model.rec_line_bits);
+            model.rec_line_bits = NULL;
+            model.rec_line_count = 0;
             return -1;
         }
     }
@@ -852,19 +1079,24 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 strerror(errno));
         cache_destroy(&model.icache);
         cache_destroy(&model.dcache);
+        free(model.rec_line_bits);
+        model.rec_line_bits = NULL;
+        model.rec_line_count = 0;
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=3 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=6 target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
-            " recsize=0x%016" PRIx64 " imode=%s phase=%s\n",
+            " recsize=0x%016" PRIx64 " imode=%s phase=%s scope=%s"
+            " coverage=%s\n",
             info->target_name ? info->target_name : "unknown", size, line,
             ways, model.sample, model.instruction_penalty, model.data_penalty,
             model.d_vipt ? "vipt" : "pipt", model.d_vipt ? "vipt" : "phys",
             rec_base, rec_size, model.i_vipt ? "vipt" : "pipt",
-            model.phase_rec ? "rec" : "boot");
+            model.phase_rec ? "rec" : "boot", model.rec_only ? "rec" : "all",
+            coverage_label());
     fflush(model.out);
     model.next_sample = model.sample;
     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
