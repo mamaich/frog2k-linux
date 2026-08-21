@@ -3597,7 +3597,7 @@ qpsx-cache-oracle-compare:
 		return -1 \
 	} \
 	FNR == 1 { file_no++ } \
-	/kind=frame/ { \
+	/^sample=.*kind=frame / { \
 		frame=value("frame"); if (frame < start) next; \
 		label=""; for (i=1; i<=NF; i++) if ($$i ~ /^label=/) { label=$$i; sub(/^label=/,"",label) } \
 		avg=value("frame_avg_cycles"); p95=value("frame_p95_cycles"); \
