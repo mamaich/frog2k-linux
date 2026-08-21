@@ -464,6 +464,11 @@ QPSX_BENCHMARK_FRAMES ?= 0
 # long a heavily instrumented QEMU run needs. A wall-clock timeout remains as
 # a failure bound when the guest never reaches the requested endpoint.
 QPSX_BENCHMARK_WAIT_FOR_FRAME ?= 1
+# Keep a small drain by default so the normal benchmark leaves the final QEMU
+# plugin/report lines flushed.  Cache-model A/B runs can set this to zero to
+# stop at the first observed fixed-frame marker rather than measuring an
+# implementation-dependent extra 60-frame slice.
+QPSX_BENCHMARK_POST_FRAME_SECONDS ?= 1
 # The browser accepts this opt-in command-line path before drawing its home
 # menu.  Keeping it configurable makes QEMU and physical A/B runs start at
 # the same frame without injecting timing-sensitive key events.
@@ -526,6 +531,11 @@ QEMU_CACHE_MODEL_SAMPLE ?= 10000000
 QEMU_CACHE_MODEL_IPENALTY ?= 8
 QEMU_CACHE_MODEL_DPENALTY ?= 12
 QEMU_CACHE_MODEL_LABEL ?= qpsx
+# The QPSX PIE executable text is loaded at 0x83000000 and is currently
+# 0x10ef50 bytes long.  A rounded 0x120000 window leaves room for small core
+# layout changes while keeping scope=core far cheaper than scope=all.
+QEMU_CACHE_MODEL_COREBASE ?= 0x83000000
+QEMU_CACHE_MODEL_CORESIZE ?= 0x120000
 # recMem is printed by QPSX at startup.  Source/flag changes move the static
 # buffer by a few hundred bytes, so the default plugin mode uses a conservative
 # executable-only 8.5 MiB window and reports the observed rec PC range.  Pass
@@ -3329,7 +3339,7 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 					'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log; then break; fi; \
 				sleep 1; waited=$$((waited + 1)); \
 			done; \
-			sleep 1; \
+			sleep '$(QPSX_BENCHMARK_POST_FRAME_SECONDS)'; \
 		else \
 			sleep '$(QPSX_BENCHMARK_SECONDS)'; \
 		fi; \
@@ -3369,6 +3379,9 @@ benchmark-linux-qpsx-attract-dev:
 QEMU_CACHE_MODEL_BOOT_SECONDS ?= 5
 QEMU_CACHE_MODEL_SECONDS ?= 45
 QEMU_CACHE_MODEL_FRAMES ?= 2700
+# A cache profile is compared at a fixed guest frame, so do not include the
+# normal benchmark's post-marker drain in the model's final sample.
+QEMU_CACHE_MODEL_POST_FRAME_SECONDS ?= 0
 QEMU_CACHE_MODEL_QEMU_ARGS ?=
 # Deterministic GE command-work counters for the same benchmark. Keep this
 # off by default; enabling it adds only sparse log lines and never changes GE
@@ -3384,6 +3397,10 @@ QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
 # sweep; the default is the 16-KiB, 2-way, 16-byte-line VIPT profile reported
 # by physical SF2000/GB300 kernel logs. QEMU's stock 24Kc CP0 currently reports
 # 2 KiB, so pass QEMU_CACHE_MODEL_SIZE=2048 to model that QEMU mismatch.
+# `scope=rec` measures generated PlayStation blocks; `scope=core` measures the
+# loaded QPSX static text in the small 0x83000000 window and is the appropriate
+# directional profile for C/assembly raster changes. `scope=all` remains a
+# forensic mode because instrumenting every Linux/helper instruction is slow.
 # The default recbase=auto window follows static Linux PIE layouts; pass an
 # exact QEMU_CACHE_MODEL_RECBASE when the core is deliberately linked outside
 # the normal 0x832xxxxx recMem window.
@@ -3398,8 +3415,9 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 		QPSX_BENCHMARK_SD_TARGET='$(QEMU_CACHE_MODEL_SD_TARGET)' \
 		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
+		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
@@ -3439,8 +3457,9 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
 		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
 		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
+		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
 		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
-		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)'"
 	test -s '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
 	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \

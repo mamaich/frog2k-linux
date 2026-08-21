@@ -97,7 +97,10 @@ typedef struct {
     uint64_t insn_classes[INSN_CLASS_COUNT];
     uint64_t rec_base;
     uint64_t rec_end;
+    uint64_t core_base;
+    uint64_t core_end;
     int rec_base_auto;
+    int core_only;
     uint64_t rec_i_accesses;
     uint64_t rec_i_misses;
     uint64_t rec_d_accesses;
@@ -187,8 +190,41 @@ static int pc_is_rec_code(uint64_t pc)
     return pc >= model.rec_base && pc < model.rec_end;
 }
 
+/* The QPSX core is loaded as a fixed-base NOMMU PIE by the frontend.  Its
+ * executable PT_LOAD is below the generated recRAM window (0x832xxxxx), so a
+ * core-only pass can measure the static emulator/raster code without paying
+ * for every Linux/helper instruction.  Keep this predicate separate from
+ * pc_is_rec_code(): generated PSX blocks and the core's C/assembly text are
+ * two different optimization surfaces. */
+static int pc_is_core_code(uint64_t pc)
+{
+    return pc >= model.core_base && pc < model.core_end;
+}
+
+static int pc_is_selected(uint64_t pc)
+{
+    if (model.core_only) {
+        return pc_is_core_code(pc);
+    }
+    if (model.rec_only) {
+        return pc_is_rec_code(pc);
+    }
+    return 1;
+}
+
+static const char *scope_label(void)
+{
+    if (model.core_only) {
+        return "core";
+    }
+    return model.rec_only ? "rec" : "all";
+}
+
 static const char *coverage_label(void)
 {
+    if (model.core_only) {
+        return "core-text";
+    }
     if (!model.phase_rec) {
         return "full";
     }
@@ -550,11 +586,11 @@ static void write_hotspots(const char *kind)
         return;
     }
     fprintf(out,
-            "# sf2000-cache-model hotspots version=10 sample=%" PRIu64
+            "# sf2000-cache-model hotspots version=11 sample=%" PRIu64
             " kind=%s instructions=%" PRIu64 " scope=%s coverage=%s"
             " label=%s\n",
             model.sample_no, kind, model.instructions,
-            model.rec_only ? "rec" : "all",
+            scope_label(),
             coverage_label(), model.label);
     for (rank = 0; rank < sizeof(top) / sizeof(top[0]); rank++) {
         HotspotEntry *entry = top[rank];
@@ -705,7 +741,7 @@ static void write_report(const char *kind)
             " est_cycles=%" PRIu64 " delta_instructions=%" PRIu64
             " delta_i_misses=%" PRIu64 " delta_d_misses=%" PRIu64 "\n",
             model.sample_no, kind, model.label, model.instructions,
-            model.rec_only ? "rec" : "all",
+            scope_label(),
             coverage_label(), model.rec_base,
             model.i_accesses, model.i_misses, model.i_invalidations,
             model.d_accesses,
@@ -785,7 +821,7 @@ static void tb_exec(unsigned int vcpu_index, void *userdata)
         model.phase_active = 1;
     }
     for (index = 0; index < tb->count; index++) {
-        if (model.rec_only && !pc_is_rec_code(tb->pc[index])) {
+        if (!pc_is_selected(tb->pc[index])) {
             continue;
         }
         model.instructions++;
@@ -839,6 +875,9 @@ static void mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
 
         hot = mem->hot;
         pc = mem->pc;
+    }
+    if (!pc_is_selected(pc)) {
+        return;
     }
     hwaddr = qemu_plugin_get_hwaddr(info, vaddr);
     if (hwaddr && qemu_plugin_hwaddr_is_io(hwaddr)) {
@@ -945,6 +984,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     TranslationBlock *data;
     size_t index;
     size_t rec_count = 0;
+    size_t core_count = 0;
 
     /* "auto" is a layout detector, not merely an alias for the historical
      * 0x83200000 constant.  Static-link changes can move recMem by a few
@@ -982,7 +1022,18 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * recRAM block are still measured, and the generated-code microscope is
      * unchanged.  The report labels this as phase=rec so callers do not
      * mistake it for a boot-inclusive profile. */
-    if (model.rec_only) {
+    if (model.core_only) {
+        for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
+
+            if (pc_is_core_code(qemu_plugin_insn_vaddr(insn))) {
+                core_count++;
+            }
+        }
+        if (core_count == 0) {
+            return;
+        }
+    } else if (model.rec_only) {
         for (index = 0; index < qemu_plugin_tb_n_insns(tb); index++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, index);
 
@@ -1053,7 +1104,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         {
             MemData *mem = calloc(1, sizeof(*mem));
 
-            if (mem && (!model.rec_only || pc_is_rec_code(data->pc[index]))) {
+            if (mem && pc_is_selected(data->pc[index])) {
                 mem->pc = data->pc[index];
                 if (data->hot) {
                     data->hot[index] = hotspot_lookup(data->pc[index]);
@@ -1068,7 +1119,7 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 free(mem);
             }
         }
-        if (!model.rec_only || pc_is_rec_code(data->pc[index])) {
+        if (pc_is_selected(data->pc[index])) {
             qemu_plugin_register_vcpu_mem_cb(insn, mem_access,
                                              QEMU_PLUGIN_CB_NO_REGS,
                                              QEMU_PLUGIN_MEM_RW, mem_userdata);
@@ -1114,6 +1165,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
      * block as helper code whenever the core layout changes. */
     uint64_t rec_base = UINT64_C(0x83200000);
     uint64_t rec_size = UINT64_C(0x00880000);
+    uint64_t core_base = UINT64_C(0x83000000);
+    uint64_t core_size = UINT64_C(0x00120000);
     int rec_base_auto = 1;
     int index;
     const char *out_path = NULL;
@@ -1124,6 +1177,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     model.d_vipt = 1;
     model.i_vipt = 1;
     model.rec_only = 0;
+    model.core_only = 0;
     model.phase_rec = 0;
     model.phase_active = 1;
     snprintf(model.label, sizeof(model.label), "sf2000");
@@ -1178,10 +1232,16 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (key_length == 5 && strncmp(key, "scope", key_length) == 0) {
             if (strcmp(value, "all") == 0) {
                 model.rec_only = 0;
+                model.core_only = 0;
             } else if (strcmp(value, "rec") == 0) {
                 model.rec_only = 1;
+                model.core_only = 0;
+            } else if (strcmp(value, "core") == 0) {
+                model.rec_only = 0;
+                model.core_only = 1;
             } else {
-                fprintf(stderr, "sf2000-cache-model: scope must be all or rec\n");
+                fprintf(stderr,
+                        "sf2000-cache-model: scope must be all, rec or core\n");
                 return -1;
             }
         } else if (key_length == 3 && strncmp(key, "out", key_length) == 0) {
@@ -1200,6 +1260,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             }
         } else if (key_length == 7 && strncmp(key, "recsize", key_length) == 0) {
             rec_size = parse_u64(value, rec_size);
+        } else if (key_length == 8 && strncmp(key, "corebase", key_length) == 0) {
+            core_base = parse_u64(value, core_base);
+        } else if (key_length == 8 && strncmp(key, "coresize", key_length) == 0) {
+            core_size = parse_u64(value, core_size);
         } else {
             fprintf(stderr, "sf2000-cache-model: unknown option '%s'\n",
                     argv[index]);
@@ -1208,6 +1272,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     if (!out_path || !*out_path || model.sample == 0 || rec_size == 0 ||
         rec_base > UINT64_MAX - rec_size ||
+        core_size == 0 || core_base > UINT64_MAX - core_size ||
         cache_init(&model.icache, size, line, ways) != 0 ||
         cache_init(&model.dcache, size, line, ways) != 0) {
         fprintf(stderr,
@@ -1220,7 +1285,16 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     model.rec_base = rec_base;
     model.rec_end = rec_base + rec_size;
+    model.core_base = core_base;
+    model.core_end = core_base + core_size;
     model.rec_base_auto = rec_base_auto;
+    /* A core-only run is deliberately boot-inclusive for the selected text:
+     * waiting for a recRAM block would skip the static executable TBs that we
+     * want to measure. */
+    if (model.core_only) {
+        model.phase_rec = 0;
+        model.phase_active = 1;
+    }
     model.rec_line_count = (size_t)((rec_size + line - 1) / line);
     if (model.rec_line_count > SIZE_MAX - 7 ||
         !(model.rec_line_bits = calloc((model.rec_line_count + 7) / 8, 1))) {
@@ -1255,19 +1329,21 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
     fprintf(model.out,
-            "# sf2000-cache-model version=10 target=%s profile=size=%" PRIu64
+            "# sf2000-cache-model version=11 target=%s profile=size=%" PRIu64
             ",line=%" PRIu64 ",ways=%" PRIu64 " sample=%" PRIu64
             " ipenalty=%" PRIu64 " dpenalty=%" PRIu64
             " dmode=%s address=i-vaddr,d=%s recbase=0x%016" PRIx64
             " recbase_mode=%s recsize=0x%016" PRIx64
-            " imode=%s phase=%s scope=%s"
+            " imode=%s phase=%s scope=%s corebase=0x%016" PRIx64
+            " coresize=0x%016" PRIx64
             " coverage=%s\n",
             info->target_name ? info->target_name : "unknown", size, line,
             ways, model.sample, model.instruction_penalty, model.data_penalty,
             model.d_vipt ? "vipt" : "pipt", model.d_vipt ? "vipt" : "phys",
             rec_base, rec_base_auto ? "auto" : "exact", rec_size,
             model.i_vipt ? "vipt" : "pipt",
-            model.phase_rec ? "rec" : "boot", model.rec_only ? "rec" : "all",
+            model.phase_rec ? "rec" : "boot", scope_label(),
+            model.core_base, model.core_end - model.core_base,
             coverage_label());
     fflush(model.out);
     model.next_sample = model.sample;
