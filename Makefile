@@ -538,7 +538,8 @@ run-qemu-stock-fatfs-writeback smoke-qemu-stock-fatfs-writeback \
 	run-linux-snes9x2005 smoke-linux-snes9x2005 \
 	run-linux-snes9x2002 smoke-linux-snes9x2002 \
 	gpsp-real-test-sd run-linux-gpsp-real smoke-linux-gpsp-real \
-	qpsx-mips32r1-audit qpsx-real-test-sd run-linux-qpsx-real smoke-linux-qpsx-real \
+	qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
+	run-linux-qpsx-real smoke-linux-qpsx-real \
 	qpsx-no-menu-test-sd run-linux-qpsx-no-menu smoke-linux-qpsx-no-menu \
 	qpsx-dev-real-test-sd qpsx-dev-no-menu-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
@@ -597,6 +598,8 @@ help:
 		'make elf-audit             reject bFLT/dynamic ELF in the rootfs' \
 		'make METRICS_LOG=loglinux.txt metrics-frontend  summarize emulator sessions' \
 		'make smoke-linux-full-asd  boot the full-rootfs artifact in QEMU' \
+		'make qpsx-production-real-test-sd QPSX_REAL_IMAGE=...  rebuild/audit/stage only the production QPSX core' \
+		'make qpsx-dev-real-test-sd QPSX_REAL_IMAGE=...  rebuild/stage the incremental profiler QPSX core' \
 		'make smoke-linux-full-ge-no-irq  boot with the GE completion IRQ suppressed' \
 		'make smoke-linux-full-stale-ram  boot with stale garbage prefill in RAM' \
 		'make ROOTFS=full qpsx-no-menu-physical  stage a temporary direct-game QPSX SD diagnostic'
@@ -2717,6 +2720,18 @@ $(QPSX_REAL_TEST_CORE_STAMP): $(QPSX_REAL_TEST_SD) \
 	touch '$@'
 
 qpsx-real-test-sd: $(QPSX_REAL_TEST_CORE_STAMP)
+
+# Rebuild and audit only the production QPSX core, then install it in the
+# already-populated real-game SD image.  This deliberately does not depend on
+# SDCARD_CORE_STAMP, linux-full-asd, or any unrelated core.  It is the fast
+# physical-device loop after a QPSX/frontend source change: the ASD and disc
+# remain untouched unless the caller changes them explicitly.
+qpsx-production-real-test-sd: FORCE
+	$(FRONTEND_MAKE) qpsx-mips32r1-audit \
+		QPSX_AUDIT_EXECUTABLE='build/sf2000-qpsx' \
+		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))'
+	$(MAKE) qpsx-real-test-sd QPSX_REAL_CORE_DEP= \
+		QPSX_TEST_CORE='$(FRONTEND_PROJECT)/build/sf2000-qpsx'
 
 # Rebuild and stage only QPSX from its development checkout.  This avoids the
 # all-core SDCARD_CORE_STAMP and is the intended edit/build/QEMU loop.
