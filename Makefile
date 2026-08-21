@@ -3522,7 +3522,7 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
 	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
-		grep -Eq '^gte .*map_status=ok .*entries=[1-9][0-9]* ' \
+		grep -Eq '^gte .*entries=[1-9][0-9]* .*map_status=ok ' \
 			'$(QEMU_CACHE_MODEL_LOG)' || { \
 			echo 'GTE oracle map produced no executed entry points' >&2; exit 2; \
 		}; \
@@ -3575,7 +3575,7 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
 	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
 	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
-		grep -Eq '^gte .*map_status=ok .*entries=[1-9][0-9]* ' \
+		grep -Eq '^gte .*entries=[1-9][0-9]* .*map_status=ok ' \
 			'$(QEMU_CACHE_MODEL_LOG)' || { \
 			echo 'GTE oracle map produced no executed entry points' >&2; exit 2; \
 		}; \
