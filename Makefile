@@ -456,7 +456,12 @@ QPSX_VARIANT_CORE := $(QPSX_VARIANTS_DIR)/sf2000-qpsx-$(QPSX_VARIANT)
 QPSX_AUDIT_STAMP := $(BUILD_DIR)/sdcard/sf2000/cores/.qpsx-mips32r1-audited
 QPSX_REAL_CORE_DEP ?= qpsx-mips32r1-audit
 QPSX_BENCHMARK_SD_TARGET ?= qpsx-no-menu-test-sd
-QPSX_BENCHMARK_ASD_TARGET ?= linux-full-asd
+# Keep diagnostic benchmark kernels separate from the production ASD.  The
+# latter is what gets copied to a physical SD card; benchmark command lines
+# intentionally contain SF2000_UNCAPPED/SF2000_BENCHMARK_FRAMES and must never
+# leak into that image.
+QPSX_BENCHMARK_ASD ?= $(BUILD_DIR)/sf2000-linux-full-test.asd
+QPSX_BENCHMARK_ASD_TARGET ?= linux-full-test-asd
 QPSX_BENCHMARK_SECONDS ?= 25
 QPSX_BENCHMARK_BOOT_SECONDS ?= 5
 QPSX_BENCHMARK_FRAMES ?= 0
@@ -2487,7 +2492,8 @@ linux-full-asd:
 # layout.  Keeping that distinction explicit prevents an emulator iteration
 # from rebuilding and checksumming every libretro core.
 linux-full-test-asd:
-	$(ISOLATED_MAKE) ROOTFS=full SDCARD_ASD_SYNC=0 linux-asd
+	$(ISOLATED_MAKE) ROOTFS=full SDCARD_ASD_SYNC=0 \
+		LINUX_ASD='$(abspath $(QPSX_BENCHMARK_ASD))' linux-asd
 
 # The SD-card artifact must contain the full userspace/menu.  Keep this
 # explicit alias next to the historical target so a bare `make linux-asd`
@@ -3365,7 +3371,7 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 		printf 'quit\n') | \
 		SF2000_SCANOUT_ORACLE=0 SF2000_GE_PROFILE='$(QEMU_GE_PROFILE)' '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
 		$(QEMU_PERF_ARGS) $(QEMU_PLUGIN_ARGS) \
-		-kernel '$(BUILD_DIR)'/sf2000-linux-full.asd \
+		-kernel '$(QPSX_BENCHMARK_ASD)' \
 		-drive if=none,id=sd0,file='$(QPSX_REAL_TEST_SD)',format=raw \
 		-display none -serial none -monitor stdio \
 		-d guest_errors,unimp \
@@ -3539,7 +3545,6 @@ benchmark-linux-qpsx-cache-model: qemu-cache-plugin
 # prepare the no-menu image and uncapped ASD once, then sweep cache profiles or
 # core binaries without paying the image/kernel build cost on every run.
 benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
-	test -s '$(BUILD_DIR)/sf2000-linux-full.asd'
 	test -s '$(QPSX_REAL_TEST_SD)'
 	if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
 		test -s '$(QEMU_CACHE_MODEL_GTE_MAP)'; test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'; \
@@ -3551,6 +3556,7 @@ benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
 	$(MAKE) --no-print-directory ROOTFS=full SDCARD_ASD_SYNC=0 \
 		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
 			LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' linux-full-test-asd,)
+	test -s '$(QPSX_BENCHMARK_ASD)'
 	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
 		grep -q '^menu_at_start=0$$'
 	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
