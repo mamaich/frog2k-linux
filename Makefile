@@ -629,7 +629,7 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	gpsp-smc-test-roms run-linux-gpsp-smc smoke-linux-gpsp-smc \
 	run-linux-frontend-lifecycle smoke-linux-frontend-lifecycle \
 	run-linux-full-input smoke-linux-full-input \
-	metrics-linux metrics-frontend metrics-qemu-fidelity benchmark-qemu-linux \
+	metrics-linux metrics-frontend metrics-frontend-detail metrics-qemu-fidelity benchmark-qemu-linux \
 	qemu-cache-plugin benchmark-linux-qpsx-cache-model \
 	run-linux-full-fidelity smoke-linux-full-fidelity \
 	smoke-linux-physical-contract metrics-qemu-timing \
@@ -4177,6 +4177,76 @@ metrics-frontend:
 			gpsp, field("failures") + 0; \
 	} \
 	END { emit() } \
+	' '$(METRICS_LOG)'
+
+# Machine-readable physical benchmark detail.  The historical metrics-frontend
+# summary intentionally keeps one row per session, but its session-wide maximum
+# cannot answer whether a candidate improved the difficult 1200..2700 phase.
+# Preserve each cumulative checkpoint, its interval delta, and each 300-frame
+# histogram.  A decreasing frame counter (including a tail record that arrives
+# before the next audio record) starts a new session, so repeated tests in one
+# log remain independently attributable.
+metrics-frontend-detail:
+	@awk '\
+	function field(name,   i,p) { \
+		for (i = 1; i <= NF; i++) { \
+			p = index($$i, "="); \
+			if (p && substr($$i, 1, p - 1) == name) return substr($$i, p + 1); \
+		} \
+		return ""; \
+	} \
+	function end_session(   unused) { \
+		if (!session_seen) return; \
+		printf "frontend.detail.session.%u.end_frames=%u\n", session, last_frames; \
+		printf "frontend.detail.session.%u.end_elapsed_ms=%u\n", session, last_elapsed; \
+	} \
+	function new_session(   unused) { \
+		end_session(); session++; session_seen = 0; \
+		last_frames = last_elapsed = -1; \
+		last_tail = -1; \
+	} \
+	/source=frontend-metric audio metric/ { \
+		frames = field("frames") + 0; elapsed = field("elapsed_ms") + 0; \
+		# cpu_process_us, late_frames, and sampled_* are interval values: the \
+		# frontend resets their baselines after every 300-frame report. \
+		cpu = field("cpu_process_us") + 0; late = field("late_frames") + 0; \
+		if (session_seen && (frames < last_frames || field("mode") != mode)) new_session(); \
+		mode = field("mode"); session_seen = 1; \
+		printf "frontend.detail.session.%u.checkpoint.%u.frames=%u\n", session, frames, frames; \
+		printf "frontend.detail.session.%u.checkpoint.%u.elapsed_ms=%u\n", session, frames, elapsed; \
+		printf "frontend.detail.session.%u.checkpoint.%u.fps=%.3f\n", session, frames, field("fps_milli") / 1000; \
+		printf "frontend.detail.session.%u.checkpoint.%u.cpu_process_us=%u\n", session, frames, cpu; \
+		printf "frontend.detail.session.%u.checkpoint.%u.sampled_max_run_us=%u\n", session, frames, field("sampled_max_run_us") + 0; \
+		printf "frontend.detail.session.%u.checkpoint.%u.sampled_present_us=%u\n", session, frames, field("sampled_present_us") + 0; \
+		printf "frontend.detail.session.%u.checkpoint.%u.late_frames=%u\n", session, frames, late; \
+		if (last_frames >= 0 && elapsed > last_elapsed) { \
+			df = frames - last_frames; dm = elapsed - last_elapsed; dc = cpu; dl = late; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_frames=%u\n", session, frames, df; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_ms=%u\n", session, frames, dm; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_fps=%.3f\n", session, frames, df * 1000 / dm; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_cpu_process_us=%u\n", session, frames, dc; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_cpu_pct=%.3f\n", session, frames, dc * 100 / dm / 1000; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_late_frames=%u\n", session, frames, dl; \
+		} \
+		last_frames = frames; last_elapsed = elapsed; \
+	} \
+	/source=frontend-metric frame-tail/ { \
+		tail = field("video_frames") + 0; \
+		if (last_tail >= 0 && tail < last_tail) new_session(); \
+		printf "frontend.detail.session.%u.tail.%u.samples=%u\n", session, tail, field("samples") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.avg_us=%u\n", session, tail, field("avg_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p95_us=%u\n", session, tail, field("p95_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p98_us=%u\n", session, tail, field("p98_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p99_us=%u\n", session, tail, field("p99_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p999_us=%u\n", session, tail, field("p999_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_avg_us=%u\n", session, tail, field("core_avg_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p95_us=%u\n", session, tail, field("core_p95_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p98_us=%u\n", session, tail, field("core_p98_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p99_us=%u\n", session, tail, field("core_p99_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p999_us=%u\n", session, tail, field("core_p999_us") + 0; \
+		last_tail = tail; \
+	} \
+	END { end_session() } \
 	' '$(METRICS_LOG)'
 
 benchmark-qemu-linux: qemu linux-full-asd
