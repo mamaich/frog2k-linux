@@ -477,6 +477,11 @@ QPSX_BENCHMARK_WAIT_FOR_FRAME ?= 1
 # stop at the first observed fixed-frame marker rather than measuring an
 # implementation-dependent extra 60-frame slice.
 QPSX_BENCHMARK_POST_FRAME_SECONDS ?= 1
+# Cache-model timing runs normally disable framebuffer sampling to avoid
+# perturbing their wall-time result.  Correctness gates enable it explicitly;
+# a core that calls retro_run while the emulated game is stuck must not be
+# accepted as a faster candidate.
+QPSX_BENCHMARK_SCANOUT_ORACLE ?= 0
 # The browser accepts this opt-in command-line path before drawing its home
 # menu.  Keeping it configurable makes QEMU and physical A/B runs start at
 # the same frame without injecting timing-sensitive key events.
@@ -636,6 +641,7 @@ qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
 	qpsx-production-sweep qpsx-production-benchmark qpsx-stage-variant \
 	run-linux-qpsx-real smoke-linux-qpsx-real \
 	qpsx-no-menu-test-sd run-linux-qpsx-no-menu smoke-linux-qpsx-no-menu \
+	smoke-linux-qpsx-attract-visual \
 	qpsx-dev-real-test-sd qpsx-dev-no-menu-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
 	benchmark-linux-qpsx-attract-dev \
@@ -3394,7 +3400,7 @@ run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCH
 			sleep '$(QPSX_BENCHMARK_SECONDS)'; \
 		fi; \
 		printf 'quit\n') | \
-		SF2000_SCANOUT_ORACLE=0 SF2000_GE_PROFILE='$(QEMU_GE_PROFILE)' '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
+		SF2000_SCANOUT_ORACLE='$(QPSX_BENCHMARK_SCANOUT_ORACLE)' SF2000_GE_PROFILE='$(QEMU_GE_PROFILE)' '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
 		$(QEMU_PERF_ARGS) $(QEMU_PLUGIN_ARGS) \
 		-kernel '$(QPSX_BENCHMARK_ASD)' \
 		-drive if=none,id=sd0,file='$(QPSX_REAL_TEST_SD)',format=raw \
@@ -3417,6 +3423,30 @@ benchmark-linux-qpsx-attract:
 	}' '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
 	! grep -Eq 'Instruction bus error|Data bus error|fatal signal|signal 11|Kernel panic|frontend: fault|core (init|load|run) timeout' \
 		'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
+
+# A timing result is meaningful only after the guest has produced sustained
+# game output.  Startup/menu changes made the older distinct/nonblack test too
+# permissive: the broken ASM-read core reached six scanouts and then remained
+# black while retro_run itself kept returning.  Ridge Racer's healthy boot is
+# well past scanout 60, with a non-trivial palette and visible pixels.
+smoke-linux-qpsx-attract-visual: qemu
+	$(MAKE) --no-print-directory run-linux-qpsx-attract-benchmark \
+		QPSX_BENCHMARK_ASD_TARGET= QPSX_BENCHMARK_SD_TARGET= \
+		QPSX_BENCHMARK_SCANOUT_ORACLE=1 \
+		QPSX_BENCHMARK_WAIT_FOR_FRAME=0 \
+		QPSX_BENCHMARK_BOOT_SECONDS=5 QPSX_BENCHMARK_SECONDS=12
+	awk '/scanout-oracle/ { \
+		seq=0; distinct=0; nonblack=0; \
+		for (i=1; i<=NF; i++) { \
+			if ($$i ~ /^seq=/) { split($$i, a, "="); seq=a[2]+0; } \
+			if ($$i ~ /^distinct=/) { split($$i, b, "="); distinct=b[2]+0; } \
+			if ($$i ~ /^nonblack=/) { split($$i, c, "="); nonblack=c[2]+0; } \
+		} \
+		if (seq >= 60 && distinct >= 8 && nonblack >= 1000) visible=1; \
+	} END{exit !visible}' '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
+	! grep -Eq 'Instruction bus error|Data bus error|fatal signal|signal 11|Kernel panic|frontend: fault|core (init|load|run) timeout' \
+		'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
+	@printf 'PASS smoke-linux-qpsx-attract-visual\n'
 
 benchmark-linux-qpsx-attract-dev:
 	$(MAKE) benchmark-linux-qpsx-attract \
