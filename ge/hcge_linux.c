@@ -67,6 +67,11 @@ static const struct hcge_format hcge_formats[] = {
 	{ HCGE_DSPF_RGB32, 0, 4 },
 	{ HCGE_DSPF_ARGB, 1, 4 },
 	{ HCGE_DSPF_ARGB4444, 3, 2 },
+	/* The PS1 VRAM layout is BGR555 (red in bits 0..4).  The vendor uses the
+	 * same 15-bit hardware node code as RGB555; the public format enum carries
+	 * the channel interpretation while avoiding a CPU channel-swizzle copy. */
+	{ HCGE_DSPF_RGB555, 4, 2 },
+	{ HCGE_DSPF_BGR555, 4, 2 },
 };
 
 static const struct hcge_format *hcge_get_format(HCGESurfacePixelFormat format)
@@ -103,6 +108,12 @@ static uint32_t hcge_surface_color(HCGESurfacePixelFormat format,
 		return ((uint32_t)(color.a >> 7) << 15) |
 			((uint32_t)(color.r >> 3) << 10) |
 			((uint32_t)(color.g >> 3) << 5) | (color.b >> 3);
+	case HCGE_DSPF_RGB555:
+		return ((uint32_t)(color.r >> 3) << 10) |
+			((uint32_t)(color.g >> 3) << 5) | (color.b >> 3);
+	case HCGE_DSPF_BGR555:
+		return ((uint32_t)(color.b >> 3) << 10) |
+			((uint32_t)(color.g >> 3) << 5) | (color.r >> 3);
 	case HCGE_DSPF_RGB16:
 		/* Bit 16 is the vendor RGB565 paint-format tag. */
 		return 0x00010000u | ((uint32_t)(color.r & 0xf8u) << 8) |
@@ -157,9 +168,24 @@ static uint32_t hcge_surface_buffer(HCGESurfacePixelFormat format,
 	uint32_t pitch)
 {
 	const struct hcge_format *description = hcge_get_format(format);
+	uint32_t context;
 
-	return description ? (uint32_t)description->code << 12 |
-		((pitch / description->bytes) & 0xfffu) : 0;
+	if (!description)
+		return 0;
+	/*
+	 * The HC15xx stores the 15-bit RGB/BGR distinction in the source
+	 * context's rgb_order field (bits 17..18), not in the five-bit color
+	 * format code.  The public vendor enum exposes RGB555 and BGR555, but
+	 * the vendor serializer emits the same code (4) for both and leaves the
+	 * order field at RGB.  PS1 VRAM is BGR555: red occupies bits 0..4 and
+	 * blue bits 10..14.  Set ORDER_BGR here so the GE performs the channel
+	 * interpretation while it converts/stretches the live VRAM surface.
+	 */
+	context = (uint32_t)description->code << 12 |
+		((pitch / description->bytes) & 0xfffu);
+	if (format == HCGE_DSPF_BGR555)
+		context |= 0x00020000u; /* rgb_order = ORDER_BGR */
+	return context;
 }
 
 static bool hcge_rectangle_valid(const HCGERectangle *rectangle)
@@ -245,6 +271,16 @@ static uint32_t hcge_color_key_argb(HCGESurfacePixelFormat format,
 	case HCGE_DSPF_ARGB1555:
 		blue = color & 0x1fu;
 		/* Preserve the vendor's bit-spread operation, including alpha. */
+		return ((color << 4) & 0x00070000u) |
+			((color << 1) & 0x00000700u) | (blue >> 2) |
+			((color << 9) & 0x07f80000u) |
+			((color << 6) & 0x0007f800u) | (blue << 3);
+	case HCGE_DSPF_RGB555:
+	case HCGE_DSPF_BGR555:
+		/* The vendor's 15-bit key path deliberately uses the same bit
+		 * spread as ARGB1555 (including bit 15), even for BGR555 source
+		 * surfaces. Keep this byte-identical for custom-key operations. */
+		blue = color & 0x1fu;
 		return ((color << 4) & 0x00070000u) |
 			((color << 1) & 0x00000700u) | (blue >> 2) |
 			((color << 9) & 0x07f80000u) |

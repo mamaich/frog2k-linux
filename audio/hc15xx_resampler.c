@@ -1,7 +1,59 @@
 // SPDX-License-Identifier: MIT
 #include "hc15xx_resampler.h"
 
+#include <limits.h>
 #include <stddef.h>
+
+static __attribute__((noinline, cold)) size_t process_wide_rates(
+	struct hc15xx_resampler *state,
+	const int16_t *stereo, size_t frames, int16_t *mono, size_t capacity)
+{
+	uint32_t input_rate = state->input_rate;
+	uint32_t output_rate = state->output_rate;
+	uint32_t phase = state->phase;
+	int32_t previous = state->previous;
+	unsigned have_previous = state->have_previous;
+	size_t input;
+	size_t produced = 0;
+
+	/* Unusual rates retain the overflow-safe reference implementation. */
+	for (input = 0; input < frames; ++input) {
+		int32_t current = ((int32_t)stereo[input * 2] +
+			(int32_t)stereo[input * 2 + 1]) / 2;
+		uint32_t old_phase;
+		uint64_t advanced;
+		uint64_t outputs;
+		uint64_t output_index;
+
+		if (!have_previous) {
+			if (produced >= capacity)
+				break;
+			previous = current;
+			have_previous = 1;
+			mono[produced++] = (int16_t)current;
+			continue;
+		}
+		old_phase = phase;
+		advanced = (uint64_t)old_phase + output_rate;
+		outputs = advanced / input_rate;
+		if (outputs > (uint64_t)capacity - produced)
+			break;
+		for (output_index = 0; output_index < outputs; output_index++) {
+			uint64_t fraction = (uint64_t)input_rate - old_phase +
+				output_index * input_rate;
+			int64_t delta = (int64_t)current - previous;
+
+			mono[produced++] = (int16_t)(previous +
+				delta * (int64_t)fraction / output_rate);
+		}
+		phase = (uint32_t)(advanced - outputs * input_rate);
+		previous = current;
+	}
+	state->phase = phase;
+	state->previous = previous;
+	state->have_previous = (uint8_t)have_previous;
+	return produced;
+}
 
 int hc15xx_resampler_init(struct hc15xx_resampler *state,
 	uint32_t input_rate, uint32_t output_rate)
@@ -51,6 +103,27 @@ size_t hc15xx_resampler_process_stereo_s16(struct hc15xx_resampler *state,
 		return 0;
 	input_rate = state->input_rate;
 	output_rate = state->output_rate;
+	/*
+	 * The native qpsx path runs both sides at 44.1 kHz.  In that case the
+	 * generic phase/interpolation loop can only reproduce the current mono
+	 * sample, but still pays for phase bookkeeping and an integer divide per
+	 * frame on a CPU without hardware division.  Keep the exact generic path
+	 * for rate changes and non-zero carried phases.
+	 */
+	if (input_rate == output_rate && state->phase == 0) {
+		size_t count = frames < capacity ? frames : capacity;
+
+		for (input = 0; input < count; ++input)
+			mono[input] = (int16_t)(((int32_t)stereo[input * 2] +
+				(int32_t)stereo[input * 2 + 1]) / 2);
+		if (count) {
+			state->previous = mono[count - 1];
+			state->have_previous = 1;
+		}
+		return count;
+	}
+	if (input_rate > UINT16_MAX || output_rate > UINT16_MAX)
+		return process_wide_rates(state, stereo, frames, mono, capacity);
 	phase = state->phase;
 	previous = state->previous;
 	have_previous = state->have_previous;
@@ -58,9 +131,9 @@ size_t hc15xx_resampler_process_stereo_s16(struct hc15xx_resampler *state,
 		int32_t current = ((int32_t)stereo[input * 2] +
 			(int32_t)stereo[input * 2 + 1]) / 2;
 		uint32_t old_phase;
-		uint64_t advanced;
-		uint64_t outputs;
-		uint64_t output_index;
+		uint32_t advanced;
+		uint32_t outputs;
+		uint32_t output_index;
 
 		if (!have_previous) {
 			if (produced >= capacity)
@@ -71,20 +144,28 @@ size_t hc15xx_resampler_process_stereo_s16(struct hc15xx_resampler *state,
 			continue;
 		}
 		old_phase = phase;
-		advanced = (uint64_t)old_phase + output_rate;
-		outputs = advanced / input_rate;
+		advanced = old_phase + output_rate;
+		if (output_rate <= input_rate) {
+			outputs = advanced >= input_rate;
+		} else {
+			outputs = advanced / input_rate;
+		}
 		/* A slow core can require multiple outputs between two inputs. */
-		if (outputs > (uint64_t)capacity - produced)
+		if (outputs > capacity - produced)
 			break;
 		for (output_index = 0; output_index < outputs; output_index++) {
-			uint64_t fraction = (uint64_t)input_rate - old_phase +
+			uint32_t fraction = input_rate - old_phase +
 				output_index * input_rate;
-			int64_t delta = (int64_t)current - previous;
+			int32_t delta = current - previous;
+			uint32_t magnitude = (uint32_t)(delta < 0 ? -delta : delta);
+			int32_t interpolation =
+				(int32_t)(magnitude * fraction / output_rate);
 
-			mono[produced++] = (int16_t)(previous +
-				delta * (int64_t)fraction / output_rate);
+			if (delta < 0)
+				interpolation = -interpolation;
+			mono[produced++] = (int16_t)(previous + interpolation);
 		}
-		phase = (uint32_t)(advanced - outputs * input_rate);
+		phase = advanced - outputs * input_rate;
 		previous = current;
 	}
 	state->phase = phase;

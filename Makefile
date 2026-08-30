@@ -4,6 +4,7 @@ QEMU_DIR ?= $(abspath ../sf2000_qemu)
 QEMU_ORACLE_DIR ?= $(abspath $(QEMU_DIR))
 QEMU_VERSION ?= 10.2.2
 QEMU_WORK ?= /tmp/sf2000-qemu
+QEMU_SOURCE_DIR ?= $(QEMU_WORK)/qemu-$(QEMU_VERSION)
 HCLINUX_DIR := external/hclinux/2024.02.y.2
 BUILD_DIR ?= build
 INITRAMFS := $(BUILD_DIR)/initramfs.cpio
@@ -14,6 +15,15 @@ ASDPACK := $(BUILD_DIR)/asdpack
 INITRAMFS_DATE ?= 1970-01-01 UTC
 INITRAMFS_EPOCH ?= 0
 QEMU_BIN ?= $(QEMU_WORK)/qemu-$(QEMU_VERSION)/build/qemu-system-mipsel
+QEMU_CACHE_PLUGIN_SRC := tools/qemu/sf2000-cache-model.c
+QEMU_CACHE_PLUGIN := $(BUILD_DIR)/qemu/sf2000-cache-model.so
+QEMU_CACHE_MODEL_REPORT_CHECK := tools/qemu/check-cache-model-report.awk
+QEMU_CACHE_MODEL_REPORT_FIXTURE := tools/qemu/cache-model-report.sample
+QEMU_CACHE_MODEL_REPORT_INVALID_FIXTURE := tools/qemu/cache-model-report.invalid.sample
+# qemu-plugin.h is part of the QEMU source tree.  Its public header includes
+# glib.h even though this diagnostic plugin itself does not use GLib APIs.
+QEMU_PLUGIN_CFLAGS ?= -I'$(QEMU_SOURCE_DIR)/include/qemu' $(shell pkg-config --cflags glib-2.0 2>/dev/null)
+QEMU_PLUGIN_LDFLAGS ?= -shared -fPIC
 QEMU_MKSD := $(QEMU_DIR)/build/mksf2000sd
 # The SF2000 kernel is built for MIPS32r1 but deliberately uses MIPS32r2 CP0
 # features (IntCtl/EBase select-1, ehb) in per_cpu_trap_init(); the 4Km model
@@ -441,14 +451,56 @@ QPSX_REAL_TEST_BASE_PROFILE := $(BUILD_DIR)/qpsx-real-test.base-profile
 QPSX_REAL_TEST_CORE_PROFILE := $(BUILD_DIR)/qpsx-real-test.core-profile
 QPSX_REAL_TEST_CORE_STAMP := $(BUILD_DIR)/qpsx-real-test.core-installed
 QPSX_OPTIMIZE ?= -O2
+QPSX_RUNTIME_TELEMETRY ?= 1
 QPSX_TEST_CORE ?= $(BUILD_DIR)/sdcard/sf2000/cores/sf2000-qpsx
+QPSX_VARIANT ?= baseline
+QPSX_VARIANTS_DIR := $(FRONTEND_PROJECT)/build/qpsx-variants
+QPSX_VARIANT_CORE := $(QPSX_VARIANTS_DIR)/sf2000-qpsx-$(QPSX_VARIANT)
 QPSX_AUDIT_STAMP := $(BUILD_DIR)/sdcard/sf2000/cores/.qpsx-mips32r1-audited
 QPSX_REAL_CORE_DEP ?= qpsx-mips32r1-audit
 QPSX_BENCHMARK_SD_TARGET ?= qpsx-no-menu-test-sd
-QPSX_BENCHMARK_ASD_TARGET ?= linux-full-asd
+# Keep diagnostic benchmark kernels separate from the production ASD.  The
+# latter is what gets copied to a physical SD card; benchmark command lines
+# intentionally contain SF2000_UNCAPPED/SF2000_BENCHMARK_FRAMES and must never
+# leak into that image.
+QPSX_BENCHMARK_ASD ?= $(BUILD_DIR)/sf2000-linux-full-test.asd
+QPSX_BENCHMARK_ASD_TARGET ?= linux-full-test-asd
 QPSX_BENCHMARK_SECONDS ?= 25
+QPSX_BENCHMARK_BOOT_SECONDS ?= 5
+QPSX_BENCHMARK_FRAMES ?= 0
+# Fixed-frame diagnostics wait for the guest marker instead of guessing how
+# long a heavily instrumented QEMU run needs. A wall-clock timeout remains as
+# a failure bound when the guest never reaches the requested endpoint.
+QPSX_BENCHMARK_WAIT_FOR_FRAME ?= 1
+# Keep a small drain by default so the normal benchmark leaves the final QEMU
+# plugin/report lines flushed.  Cache-model A/B runs can set this to zero to
+# stop at the first observed fixed-frame marker rather than measuring an
+# implementation-dependent extra 60-frame slice.
+QPSX_BENCHMARK_POST_FRAME_SECONDS ?= 1
+# Cache-model timing runs normally disable framebuffer sampling to avoid
+# perturbing their wall-time result.  Correctness gates enable it explicitly;
+# a core that calls retro_run while the emulated game is stuck must not be
+# accepted as a faster candidate.
+QPSX_BENCHMARK_SCANOUT_ORACLE ?= 0
+# The browser accepts this opt-in command-line path before drawing its home
+# menu.  Keeping it configurable makes QEMU and physical A/B runs start at
+# the same frame without injecting timing-sensitive key events.
+QPSX_BENCHMARK_AUTO_LAUNCH ?=
+# New no-menu test images carry browser_startup.cfg. Set this to 0 only when
+# comparing against an older image whose browser predates direct launch.
+QPSX_BENCHMARK_DIRECT ?= 1
+# The fast cache-model target deliberately reuses the already-built ASD. Set
+# this to 1 only after changing the baked kernel command line or rootfs; it
+# avoids rebuilding the kernel/rootfs for every core/cache A/B experiment.
+QPSX_BENCHMARK_REBUILD_ASD ?= 0
+QPSX_BENCHMARK_CMDLINE = $(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 \
+	$(if $(filter-out 0,$(QPSX_BENCHMARK_FRAMES)),SF2000_BENCHMARK_FRAMES=$(QPSX_BENCHMARK_FRAMES),) \
+	$(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)
 SDCARD_QPSX_STARTUP_CONFIG := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg
 SDCARD_QPSX_STARTUP_CHECKSUM := $(BUILD_DIR)/sdcard/cores/config/psx_startup.cfg.sha256
+SDCARD_BROWSER_STARTUP_CONFIG := $(BUILD_DIR)/sdcard/cores/config/browser_startup.cfg
+SDCARD_BROWSER_STARTUP_CHECKSUM := $(BUILD_DIR)/sdcard/cores/config/browser_startup.cfg.sha256
+QPSX_AUTO_LAUNCH_PATH ?= /mnt/sd/PSX/00-TEST.cue
 FRONTEND_LIFECYCLE_TEST_SD := $(BUILD_DIR)/frontend-lifecycle-test.sd.img
 JS2300_TEST_SD := $(BUILD_DIR)/js2300-test.sd.img
 JS2300_UI_SMOKE_SCRIPT := $(FRONTEND_PROJECT)/tests/js2300-ui-smoke.js
@@ -474,6 +526,53 @@ QEMU_CONTRACT_LOG ?= $(BUILD_DIR)/logs/linux-full-display.log
 QEMU_BENCH_SECONDS ?= 15
 QEMU_DISPLAY_ARGS ?=
 QEMU_FIDELITY_ARGS ?= -icount shift=1,sleep=on,align=on
+# Optional arguments are intentionally separate from QEMU_FIDELITY_ARGS:
+# cache/instruction measurements must not silently change normal smoke tests.
+QEMU_PERF_ARGS ?=
+QEMU_PLUGIN_ARGS ?=
+QEMU_CACHE_MODEL_SIZE ?= 16384
+QEMU_CACHE_MODEL_LINE ?= 16
+QEMU_CACHE_MODEL_WAYS ?= 2
+QEMU_CACHE_MODEL_DMODE ?= vipt
+QEMU_CACHE_MODEL_IMODE ?= vipt
+QEMU_CACHE_MODEL_PHASE ?= rec
+# `rec` is the low-overhead generated-code microscope.  Use `all` with
+# phase=rec for a slower post-rec pass that includes recompiler helpers and
+# frontend-side instructions after the first recRAM block executes.
+QEMU_CACHE_MODEL_SCOPE ?= emu
+QEMU_CACHE_MODEL_SAMPLE ?= 10000000
+QEMU_CACHE_MODEL_IPENALTY ?= 8
+QEMU_CACHE_MODEL_DPENALTY ?= 12
+QEMU_CACHE_MODEL_LABEL ?= qpsx
+# The QPSX PIE executable text is loaded at 0x83000000 and is currently
+# 0x10ef50 bytes long.  A rounded 0x120000 window leaves room for small core
+# layout changes while keeping scope=core far cheaper than scope=all.
+QEMU_CACHE_MODEL_COREBASE ?= 0x83000000
+QEMU_CACHE_MODEL_CORESIZE ?= 0x120000
+# Development QPSX cores execute this harmless encoded no-op once per
+# retro_run. The plugin uses it to emit exact 300-frame work/tail reports and
+# freezes counters at the benchmark endpoint, independent of host polling.
+QEMU_CACHE_MODEL_FRAME_OPCODE ?= 0x000007c0
+QEMU_CACHE_MODEL_FRAME_REPORT ?= 300
+QEMU_CACHE_MODEL_FRAME_STOP ?= $(QEMU_CACHE_MODEL_FRAMES)
+# recMem is printed by QPSX at startup.  Source/flag changes move the static
+# buffer by a few hundred bytes, so the default plugin mode uses a conservative
+# executable-only 8.5 MiB window and reports the observed rec PC range.  Pass
+# an exact address when doing a forensic profile of one binary.
+QEMU_CACHE_MODEL_RECBASE ?= auto
+QEMU_CACHE_MODEL_RECSIZE ?= 0x880000
+QEMU_CACHE_MODEL_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-model.log
+QEMU_CACHE_MODEL_HOT_LOG ?= $(BUILD_DIR)/metrics/qpsx-cache-hotspots.log
+# GTE body/entry diagnostics are opt-in because the ranges must come from the
+# exact ELF under test.  The plugin verifies the map's core layout and SHA-256
+# against QEMU's coreelf= argument before installing the callbacks.
+QEMU_CACHE_MODEL_GTE_MAP ?=
+QEMU_CACHE_MODEL_GTE_ELF ?= $(QPSX_TEST_CORE)
+QEMU_CACHE_MODEL_GTE_LD_MAP ?=
+QEMU_PLUGIN_COMMA := ,
+QEMU_CACHE_MODEL_GTE_PLUGIN_ARGS = $(if $(strip $(QEMU_CACHE_MODEL_GTE_MAP)),$(QEMU_PLUGIN_COMMA)gtemap=$(QEMU_CACHE_MODEL_GTE_MAP)$(QEMU_PLUGIN_COMMA)coreelf=$(QEMU_CACHE_MODEL_GTE_ELF),)
+QEMU_CACHE_COMPARE_LOGS ?=
+QEMU_CACHE_COMPARE_START_FRAME ?= 900
 GE_VENDOR_ARCHIVE ?= $(HCRTOS_SDK_DIR)/lib/vendor/libge.a
 GE_REVERSE_DIR := $(BUILD_DIR)/reverse-ge
 GE_NODE_TEST := $(BUILD_DIR)/hcge-node-test
@@ -538,16 +637,24 @@ run-qemu-stock-fatfs-writeback smoke-qemu-stock-fatfs-writeback \
 	run-linux-snes9x2005 smoke-linux-snes9x2005 \
 	run-linux-snes9x2002 smoke-linux-snes9x2002 \
 	gpsp-real-test-sd run-linux-gpsp-real smoke-linux-gpsp-real \
-	qpsx-mips32r1-audit qpsx-real-test-sd run-linux-qpsx-real smoke-linux-qpsx-real \
+qpsx-mips32r1-audit qpsx-production-real-test-sd qpsx-real-test-sd \
+	qpsx-production-sweep qpsx-production-benchmark qpsx-stage-variant \
+	run-linux-qpsx-real smoke-linux-qpsx-real \
 	qpsx-no-menu-test-sd run-linux-qpsx-no-menu smoke-linux-qpsx-no-menu \
+	smoke-linux-qpsx-attract-visual \
 	qpsx-dev-real-test-sd qpsx-dev-no-menu-test-sd \
 	run-linux-qpsx-attract-benchmark benchmark-linux-qpsx-attract \
 	benchmark-linux-qpsx-attract-dev \
+	benchmark-linux-qpsx-cache-model-fast \
+	qemu-cache-model-report-schema-check qemu-cache-model-report-check \
+	qemu-cache-gte-map \
+	qpsx-cache-oracle-compare \
 	qpsx-no-menu-physical \
 	gpsp-smc-test-roms run-linux-gpsp-smc smoke-linux-gpsp-smc \
 	run-linux-frontend-lifecycle smoke-linux-frontend-lifecycle \
 	run-linux-full-input smoke-linux-full-input \
-	metrics-linux metrics-frontend metrics-qemu-fidelity benchmark-qemu-linux \
+	metrics-linux metrics-frontend metrics-frontend-detail metrics-qemu-fidelity benchmark-qemu-linux \
+	qemu-cache-plugin benchmark-linux-qpsx-cache-model \
 	run-linux-full-fidelity smoke-linux-full-fidelity \
 	smoke-linux-physical-contract metrics-qemu-timing \
 	run-linux-reboot smoke-linux-reboot run-linux-full-reboot \
@@ -560,7 +667,7 @@ run-qemu-stock-fatfs-writeback smoke-qemu-stock-fatfs-writeback \
 	smoke-linux-full-reset-snapshot run-linux-full-reset-restore \
 	smoke-linux-full-reset-restore reverse-ge test-ge-node \
 	test-ge-node-vendor capture-ge-vendor test-ge-vendor-capture \
-	test-ge-source-capture test-ge-formats test-ge-effects \
+	test-ge-source-capture test-ge-formats test-ge-source-formats test-ge-effects \
 	test-ge-mask test-ge-custom-keys test-ge-utils test-ge-matrix \
 	test-ge-queue test-ge-batch test-ge-filter-extract \
 	test-ge-symbol-coverage efuse-test vdec-test vdec-codec-test dsc-test \
@@ -597,6 +704,12 @@ help:
 		'make elf-audit             reject bFLT/dynamic ELF in the rootfs' \
 		'make METRICS_LOG=loglinux.txt metrics-frontend  summarize emulator sessions' \
 		'make smoke-linux-full-asd  boot the full-rootfs artifact in QEMU' \
+		'make qpsx-production-real-test-sd QPSX_REAL_IMAGE=...  rebuild/audit/stage only the production QPSX core' \
+		'make qpsx-production-sweep  build four named QPSX physical A/B variants (QPSX_RUNTIME_TELEMETRY=0 for final)' \
+		'make qpsx-production-benchmark  run the four variants against one no-menu QEMU image' \
+		'make qpsx-stage-variant QPSX_VARIANT=baseline  copy one swept core into the existing test SD image' \
+		'make qpsx-cache-oracle-compare QEMU_CACHE_COMPARE_LOGS="control.log candidate.log"  compare exact-frame QPSX model tails' \
+		'make qpsx-dev-real-test-sd QPSX_REAL_IMAGE=...  rebuild/stage the incremental profiler QPSX core' \
 		'make smoke-linux-full-ge-no-irq  boot with the GE completion IRQ suppressed' \
 		'make smoke-linux-full-stale-ram  boot with stale garbage prefill in RAM' \
 		'make ROOTFS=full qpsx-no-menu-physical  stage a temporary direct-game QPSX SD diagnostic'
@@ -628,7 +741,28 @@ ci-fresh-js2300: $(USERSPACE_JS2300)
 	@printf 'fresh JS2300 userspace target passed: %s\n' '$(USERSPACE_JS2300)'
 
 check: audio-test efuse-test vdec-test vdec-codec-test dsc-test test-ge-node \
-	memory-layout-audit check-linux-early-handoff check-linux-cacheflush
+	memory-layout-audit check-linux-early-handoff check-linux-cacheflush \
+	qemu-cache-model-report-schema-check
+
+# Validate both the field schema and its accounting invariants.  The invalid
+# fixture deliberately changes d_bytes without changing either decomposition
+# operand; a positional printf argument drift therefore fails this check even
+# though every field still parses as a valid integer.
+qemu-cache-model-report-schema-check:
+	@awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' \
+		'$(QEMU_CACHE_MODEL_REPORT_FIXTURE)'
+	@if awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' \
+		'$(QEMU_CACHE_MODEL_REPORT_INVALID_FIXTURE)' >/dev/null 2>&1; then \
+		echo 'cache-model report check: invalid fixture unexpectedly passed' >&2; \
+		exit 1; \
+	else \
+		echo 'cache-model report check: invalid fixture rejected'; \
+	fi
+
+qemu-cache-model-report-check:
+	@test -s '$(QEMU_CACHE_MODEL_LOG)'
+	@awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' \
+		'$(QEMU_CACHE_MODEL_LOG)'
 
 check-linux-early-handoff:
 	grep -Fq 'sf2000_watchdog_arm("early-watchdog-armed")' $(LINUX_PATCHES)
@@ -855,7 +989,8 @@ $(GE_LINUX_OBJ): ge/hcge_linux.c ge/ge_api.h $(TOOLCHAIN_STAMP)
 $(GE_VENDOR_CAPTURE): ge/hcge_vendor_capture.c ge/ge_api.h \
 		$(TOOLCHAIN_STAMP) $(GE_VENDOR_ARCHIVE)
 	$(GE_ELF_CC) -std=c99 -O2 -static -Ige -o '$@' '$<' \
-		'$(GE_VENDOR_ARCHIVE)' -lm -Wl,--wrap=open -Wl,--wrap=close \
+		'$(GE_VENDOR_ARCHIVE)' -lm -Wl,--wrap=open -Wl,--wrap=open64 \
+		-Wl,--wrap=close \
 		-Wl,--wrap=ioctl -Wl,--wrap=mmap -Wl,--wrap=munmap \
 		-Wl,--wrap=usleep
 
@@ -869,7 +1004,7 @@ $(GE_SOURCE_CAPTURE): ge/hcge_vendor_capture.c ge/hcge_linux.c ge/hcge_node.c ge
 		$(TOOLCHAIN_STAMP)
 	$(GE_ELF_CC) -std=c99 -O2 -static -Ige -DHCGE_SOURCE_CAPTURE \
 		-o '$@' ge/hcge_vendor_capture.c ge/hcge_linux.c ge/hcge_node.c \
-		-Wl,--wrap=open -Wl,--wrap=close -Wl,--wrap=ioctl \
+		-Wl,--wrap=open -Wl,--wrap=open64 -Wl,--wrap=close -Wl,--wrap=ioctl \
 		-Wl,--wrap=mmap -Wl,--wrap=munmap -Wl,--wrap=usleep
 
 test-ge-source-capture: $(GE_SOURCE_CAPTURE) $(GE_SOURCE_CAPTURE_GOLDEN)
@@ -877,12 +1012,32 @@ test-ge-source-capture: $(GE_SOURCE_CAPTURE) $(GE_SOURCE_CAPTURE_GOLDEN)
 		cmp - '$(GE_SOURCE_CAPTURE_GOLDEN)'
 
 test-ge-formats: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
-	set -e; for format in 0 1 3 4 7; do \
+	set -e; for format in 0 1 3 4 7 8; do \
 		qemu-mipsel '$(GE_VENDOR_CAPTURE)' 0 0 64 48 0 0 160 120 \
 			"$$format" > '$(BUILD_DIR)/.hcge-vendor-format'; \
 		qemu-mipsel '$(GE_SOURCE_CAPTURE)' 0 0 64 48 0 0 160 120 \
 			"$$format" | cmp - '$(BUILD_DIR)/.hcge-vendor-format'; \
 	done; rm -f '$(BUILD_DIR)/.hcge-vendor-format'
+
+# The vendor serializer accepts BGR555 as a source (the PS1 VRAM layout), but
+# it emits the RGB555 order bit for that source.  The portable serializer must
+# add ORDER_BGR (context bit 17) so the GE interprets PS1 red/blue lanes
+# correctly.  Keep the vendor capture as evidence, then assert the intentional
+# context difference rather than treating the vendor's channel-order bug as a
+# parity golden.
+test-ge-source-formats: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
+	set -e; HCGE_CAPTURE_SOURCE_FORMAT=9 \
+		qemu-mipsel '$(GE_VENDOR_CAPTURE)' 0 0 64 48 0 0 160 120 1 \
+		> '$(BUILD_DIR)/.hcge-vendor-source-format'; \
+	HCGE_CAPTURE_SOURCE_FORMAT=9 \
+		qemu-mipsel '$(GE_SOURCE_CAPTURE)' 0 0 64 48 0 0 160 120 1 \
+		> '$(BUILD_DIR)/.hcge-source-source-format'; \
+	test "$$(awk '$$1 == "blit-rgb16" { print $$10 }' \
+		'$(BUILD_DIR)/.hcge-source-source-format')" = 00024080; \
+	test "$$(awk '$$1 == "blit-rgb16" { print $$10 }' \
+		'$(BUILD_DIR)/.hcge-vendor-source-format')" = 00004080; \
+	rm -f '$(BUILD_DIR)/.hcge-vendor-source-format' \
+		'$(BUILD_DIR)/.hcge-source-source-format'
 
 test-ge-effects: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 	set -e; for flags in 0 1 2 3 4 5 6 7 8 16 24 32 64 128 512 1024 \
@@ -973,6 +1128,14 @@ test-ge-custom-keys: $(GE_VENDOR_CAPTURE) $(GE_SOURCE_CAPTURE)
 
 qemu:
 	$(MAKE) -C '$(QEMU_DIR)' build
+
+$(QEMU_CACHE_PLUGIN): $(QEMU_CACHE_PLUGIN_SRC) qemu
+	mkdir -p '$(dir $@)'
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -fvisibility=hidden \
+		$(QEMU_PLUGIN_CFLAGS) $(QEMU_PLUGIN_LDFLAGS) -o '$@' '$<'
+
+qemu-cache-plugin: $(QEMU_CACHE_PLUGIN)
+	@printf 'QEMU cache model plugin: %s\n' '$(QEMU_CACHE_PLUGIN)'
 
 $(QEMU_MKSD): $(QEMU_DIR)/tools/mksf2000sd.c
 	$(MAKE) -C '$(QEMU_DIR)' build/mksf2000sd
@@ -2360,7 +2523,8 @@ linux-full-asd:
 # layout.  Keeping that distinction explicit prevents an emulator iteration
 # from rebuilding and checksumming every libretro core.
 linux-full-test-asd:
-	$(ISOLATED_MAKE) ROOTFS=full SDCARD_ASD_SYNC=0 linux-asd
+	$(ISOLATED_MAKE) ROOTFS=full SDCARD_ASD_SYNC=0 \
+		LINUX_ASD='$(abspath $(QPSX_BENCHMARK_ASD))' linux-asd
 
 # The SD-card artifact must contain the full userspace/menu.  Keep this
 # explicit alias next to the historical target so a bare `make linux-asd`
@@ -2368,7 +2532,8 @@ linux-full-test-asd:
 # mistaken for a physical-device build.
 physical-linux-asd:
 	# Remove a prior diagnostic before syncing the normal physical artifact.
-	rm -f '$(SDCARD_QPSX_STARTUP_CONFIG)' '$(SDCARD_QPSX_STARTUP_CHECKSUM)'
+	rm -f '$(SDCARD_QPSX_STARTUP_CONFIG)' '$(SDCARD_QPSX_STARTUP_CHECKSUM)' \
+		'$(SDCARD_BROWSER_STARTUP_CONFIG)' '$(SDCARD_BROWSER_STARTUP_CHECKSUM)'
 	$(ISOLATED_MAKE) ROOTFS=full SDCARD_ASD_SYNC=1 linux-asd
 
 ifeq ($(SDCARD_ASD_SYNC),1)
@@ -2597,8 +2762,8 @@ $(QPSX_REAL_TEST_BASE_PROFILE): FORCE $(SDCARD_USER_CONFIG) \
 	mkdir -p '$(dir $@)'
 	@set -eu; \
 	tmp='$@.tmp'; \
-	{ \
-		printf 'menu_at_start=%s\nmin_mib=%s\nimage=%s\n' \
+		{ \
+		printf 'startup_format=2\nmenu_at_start=%s\nmin_mib=%s\nimage=%s\n' \
 			'$(QPSX_REAL_MENU_AT_START)' '$(QPSX_REAL_TEST_MIN_MIB)' \
 			'$(QPSX_REAL_IMAGE)'; \
 		sha256sum '$(SDCARD_USER_CONFIG)' '$(SDCARD_UI_FONT)' \
@@ -2684,6 +2849,12 @@ $(QPSX_REAL_TEST_SD): $(QPSX_REAL_TEST_BASE_PROFILE)
 		mcopy -i '$(QPSX_REAL_TEST_SD)' '$(BUILD_DIR)'/.qpsx-startup.cfg \
 			::/cores/config/psx_startup.cfg; \
 		rm -f '$(BUILD_DIR)'/.qpsx-startup.cfg; \
+		browser_path='/mnt/sd/PSX/TEST.BIN'; \
+		case '$(QPSX_REAL_IMAGE)' in *.[cC][uU][eE]) browser_path='/mnt/sd/PSX/00-TEST.cue';; esac; \
+		printf 'auto_launch=%s\n' "$$browser_path" > '$(BUILD_DIR)'/.browser-startup.cfg; \
+		mcopy -i '$(QPSX_REAL_TEST_SD)' '$(BUILD_DIR)'/.browser-startup.cfg \
+			::/cores/config/browser_startup.cfg; \
+		rm -f '$(BUILD_DIR)'/.browser-startup.cfg; \
 	fi
 	rm -f '$(BUILD_DIR)'/.qpsx-real-test.cfg
 	mcopy -i '$(QPSX_REAL_TEST_SD)' '$(SDCARD_UI_FONT)' ::/sf2000/ui.ttf
@@ -2718,6 +2889,75 @@ $(QPSX_REAL_TEST_CORE_STAMP): $(QPSX_REAL_TEST_SD) \
 
 qpsx-real-test-sd: $(QPSX_REAL_TEST_CORE_STAMP)
 
+# Rebuild and audit only the production QPSX core, then install it in the
+# already-populated real-game SD image.  This deliberately does not depend on
+# SDCARD_CORE_STAMP, linux-full-asd, or any unrelated core.  It is the fast
+# physical-device loop after a QPSX/frontend source change: the ASD and disc
+# remain untouched unless the caller changes them explicitly.
+qpsx-production-real-test-sd: FORCE
+	$(FRONTEND_MAKE) qpsx-mips32r1-audit \
+		QPSX_AUDIT_EXECUTABLE='build/sf2000-qpsx' \
+		QPSX_RUNTIME_TELEMETRY='$(QPSX_RUNTIME_TELEMETRY)' \
+		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))'
+	$(MAKE) qpsx-real-test-sd QPSX_REAL_CORE_DEP= \
+		QPSX_TEST_CORE='$(FRONTEND_PROJECT)/build/sf2000-qpsx'
+
+# Produce baseline/return-register/small-superblock/large-superblock cores in
+# one controlled pass.  The frontend records the exact flags and hashes in
+# build/qpsx-variants/MANIFEST; no game image or ASD is rebuilt.
+qpsx-production-sweep: FORCE
+	$(FRONTEND_MAKE) qpsx-production-sweep \
+		CROSS_COMPILE='$(patsubst %gcc,%,$(TARGET_CC))' \
+		QPSX_OPTIMIZE='$(QPSX_OPTIMIZE)' \
+		QPSX_RUNTIME_TELEMETRY='$(QPSX_RUNTIME_TELEMETRY)'
+
+# Run the complete production matrix against the same already-built, no-menu
+# SD image.  The image is deliberately not a prerequisite: recreating a 128 MiB
+# FAT image or recopied CD is much slower and would make an A/B result harder to
+# attribute.  Prepare it once with qpsx-no-menu-test-sd, then this target only
+# swaps the small core file and launches the deterministic uncapped benchmark.
+qpsx-production-benchmark: qpsx-production-sweep FORCE
+	@set -eu; \
+	test -f '$(QPSX_REAL_TEST_SD)' || { \
+		echo 'missing QPSX test SD image; run qpsx-no-menu-test-sd QPSX_REAL_IMAGE=...' >&2; exit 2; }; \
+	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
+		grep -q '^menu_at_start=0$$' || { \
+		echo 'QPSX benchmark requires a no-menu SD image; run qpsx-no-menu-test-sd first' >&2; exit 2; }; \
+	out='$(BUILD_DIR)/logs/qpsx-variant-benchmark'; \
+	mkdir -p "$$out"; \
+	: > "$$out/SUMMARY"; \
+	for variant in baseline return-ra fold2 fold8; do \
+		$(MAKE) --no-print-directory qpsx-stage-variant QPSX_VARIANT="$$variant"; \
+		$(MAKE) --no-print-directory benchmark-linux-qpsx-attract \
+			QPSX_BENCHMARK_SD_TARGET= \
+			QPSX_BENCHMARK_ASD_TARGET=linux-full-test-asd \
+			QPSX_BENCHMARK_SECONDS='$(QPSX_BENCHMARK_SECONDS)' \
+			> "$$out/$$variant.make.log" 2>&1; \
+		cp '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' "$$out/$$variant.log"; \
+		cp '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.console' "$$out/$$variant.console"; \
+		grep 'QPSX Ridge Racer attract benchmark:' "$$out/$$variant.make.log" | tail -n 1 | \
+			sed "s/^/$$variant /" | tee -a "$$out/SUMMARY"; \
+		grep -m 1 'QPSX: build knobs' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
+		if test '$(QPSX_RUNTIME_TELEMETRY)' = 1; then \
+			grep -m 1 'QPSX: rec telemetry' "$$out/$$variant.log" | tee -a "$$out/SUMMARY"; \
+		else \
+			printf '%s telemetry=disabled\\n' "$$variant" | tee -a "$$out/SUMMARY"; \
+		fi; \
+	done; \
+	cat "$$out/SUMMARY"
+
+# Install one previously swept core into the already-populated test image.
+# This is intentionally separate from qpsx-real-test-sd, so switching between
+# variants never rereads a disc image or reformats the 128 MiB filesystem.
+qpsx-stage-variant: FORCE
+	@test -f '$(QPSX_VARIANT_CORE)' || { \
+		echo 'missing QPSX variant: $(QPSX_VARIANT_CORE); run make qpsx-production-sweep first' >&2; exit 2; }
+	@test -f '$(QPSX_REAL_TEST_SD)' || { \
+		echo 'missing QPSX test SD image: $(QPSX_REAL_TEST_SD); build qpsx-real-test-sd first' >&2; exit 2; }
+	mcopy -o -i '$(QPSX_REAL_TEST_SD)' '$(QPSX_VARIANT_CORE)' \
+		::/sf2000/cores/sf2000-qpsx
+	@sha256sum '$(QPSX_VARIANT_CORE)' '$(QPSX_REAL_TEST_SD)'
+
 # Rebuild and stage only QPSX from its development checkout.  This avoids the
 # all-core SDCARD_CORE_STAMP and is the intended edit/build/QEMU loop.
 qpsx-dev-real-test-sd: FORCE
@@ -2742,8 +2982,10 @@ qpsx-no-menu-physical: physical-linux-asd
 	mkdir -p '$(dir $(SDCARD_QPSX_STARTUP_CONFIG))'
 	printf 'menu_at_start=0\nauto_menu=0\n' > '$(SDCARD_QPSX_STARTUP_CONFIG)'
 	( cd '$(BUILD_DIR)/sdcard' && sha256sum 'cores/config/psx_startup.cfg' ) > '$(SDCARD_QPSX_STARTUP_CHECKSUM)'
+	printf 'auto_launch=%s\n' '$(QPSX_AUTO_LAUNCH_PATH)' > '$(SDCARD_BROWSER_STARTUP_CONFIG)'
+	( cd '$(BUILD_DIR)/sdcard' && sha256sum 'cores/config/browser_startup.cfg' ) > '$(SDCARD_BROWSER_STARTUP_CHECKSUM)'
 	@printf 'QPSX no-menu diagnostic staged at %s\n' '$(SDCARD_QPSX_STARTUP_CONFIG)'
-	@printf '%s\n' 'Copy this file together with the normal build/sdcard tree to the test SD card, then launch QPSX without closing an internal menu.'
+	@printf '%s\n' 'Copy the staged config files with the normal build/sdcard tree to enter the configured game without browser or QPSX menu key presses.'
 
 $(BROWSER_TEST_SD): Makefile $(BROWSER_TEST_ROM) $(SDCARD_CORE_STAMP) \
 		$(SDCARD_USER_CONFIG) $(SDCARD_UI_FONT) $(SDCARD_UI_LATIN_FONT)
@@ -3125,26 +3367,51 @@ smoke-linux-qpsx-savestate: run-linux-qpsx-savestate
 # for absolute FPS because TCG does not model the HC15xx pipeline or caches.
 run-linux-qpsx-attract-benchmark: qemu $(QPSX_BENCHMARK_ASD_TARGET) $(QPSX_BENCHMARK_SD_TARGET)
 	mkdir -p '$(BUILD_DIR)'/logs
-	(sleep 5; printf 'sendkey x 100\n'; sleep 1; \
-		printf 'sendkey down 100\n'; sleep 1; \
-		printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
-		sleep 12; printf 'sendkey ret-backspace 2000\n'; sleep 2; \
-		printf 'sendkey down 200\n'; sleep 1; \
-		printf 'sendkey right 200\n'; sleep 0.3; \
-		printf 'sendkey right 200\n'; sleep 0.3; \
-		printf 'sendkey right 200\n'; sleep 0.3; \
-		printf 'sendkey right 200\n'; sleep 1; \
-		printf 'sendkey z 200\n'; sleep '$(QPSX_BENCHMARK_SECONDS)'; \
+	: > '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
+	# Launch the game from the browser, then press nothing: Ridge Racer's
+	# attract sequence advances to the demo race by itself.  Unthrottled
+	# execution comes from the SF2000_UNCAPPED=1 cmdline flag (the frontend
+	# enables benchmark mode in code), never from holding START -- a long
+	# START hold trips the core's own 1.5-sec menu and the benchmark would
+	# measure menu render instead of the race.  The cmdline is baked into
+	# the kernel at build time (the sf2000 QEMU machine ignores -append for
+	# ASD loads), so the benchmark targets rebuild the test ASD with the
+	# extended command line; the non-default cmdline keeps SDCARD_ASD_SYNC=0
+	# and never touches the physical-device artifacts.
+	# New no-menu images carry browser_startup.cfg, while an optional
+	# SF2000_AUTO_LAUNCH cmdline overrides it for QEMU. Keep the old key
+	# sequence only as an explicit compatibility fallback for older images.
+	(sleep '$(QPSX_BENCHMARK_BOOT_SECONDS)'; \
+		if test '$(QPSX_BENCHMARK_DIRECT)' != 1; then \
+			printf 'sendkey x 100\n'; sleep 1; \
+			printf 'sendkey down 100\n'; sleep 1; \
+			printf 'sendkey x 100\n'; sleep 1; printf 'sendkey x 100\n'; \
+		fi; \
+		if test '$(QPSX_BENCHMARK_WAIT_FOR_FRAME)' = 1 && \
+			test '$(QPSX_BENCHMARK_FRAMES)' -gt 0; then \
+			waited=0; \
+			while test "$$waited" -lt '$(QPSX_BENCHMARK_SECONDS)'; do \
+				if grep -Eq 'QPSX: retro_run progress: frame $(QPSX_BENCHMARK_FRAMES)$$' \
+					'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log; then break; fi; \
+				sleep 1; waited=$$((waited + 1)); \
+			done; \
+			sleep '$(QPSX_BENCHMARK_POST_FRAME_SECONDS)'; \
+		else \
+			sleep '$(QPSX_BENCHMARK_SECONDS)'; \
+		fi; \
 		printf 'quit\n') | \
-		SF2000_SCANOUT_ORACLE=0 '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
-		-kernel '$(BUILD_DIR)'/sf2000-linux-full.asd \
+		SF2000_SCANOUT_ORACLE='$(QPSX_BENCHMARK_SCANOUT_ORACLE)' SF2000_GE_PROFILE='$(QEMU_GE_PROFILE)' '$(QEMU_BIN)' -M sf2000 $(QEMU_CPU_ARGS) \
+		$(QEMU_PERF_ARGS) $(QEMU_PLUGIN_ARGS) \
+		-kernel '$(QPSX_BENCHMARK_ASD)' \
 		-drive if=none,id=sd0,file='$(QPSX_REAL_TEST_SD)',format=raw \
 		-display none -serial none -monitor stdio \
 		-d guest_errors,unimp \
 		-D '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log \
 		> '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.console 2>&1
 
-benchmark-linux-qpsx-attract: run-linux-qpsx-attract-benchmark
+benchmark-linux-qpsx-attract:
+	$(MAKE) run-linux-qpsx-attract-benchmark \
+		LINUX_CMDLINE='$(QPSX_BENCHMARK_CMDLINE)'
 	@awk '/QPSX: retro_run progress: frame (1200|1800)$$/ { \
 		line=$$0; sub(/^.*\[/, "", line); sub(/\].*$$/, "", line); \
 		time=line+0; frame=$$NF+0; if (frame == 1200) start=time; \
@@ -3157,10 +3424,309 @@ benchmark-linux-qpsx-attract: run-linux-qpsx-attract-benchmark
 	! grep -Eq 'Instruction bus error|Data bus error|fatal signal|signal 11|Kernel panic|frontend: fault|core (init|load|run) timeout' \
 		'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
 
+# A timing result is meaningful only after the guest has produced sustained
+# game output.  Startup/menu changes made the older distinct/nonblack test too
+# permissive: the broken ASM-read core reached six scanouts and then remained
+# black while retro_run itself kept returning.  Ridge Racer's healthy boot is
+# well past scanout 60, with a non-trivial palette and visible pixels.
+smoke-linux-qpsx-attract-visual: qemu
+	$(MAKE) --no-print-directory run-linux-qpsx-attract-benchmark \
+		QPSX_BENCHMARK_ASD_TARGET= QPSX_BENCHMARK_SD_TARGET= \
+		QPSX_BENCHMARK_SCANOUT_ORACLE=1 \
+		QPSX_BENCHMARK_WAIT_FOR_FRAME=0 \
+		QPSX_BENCHMARK_BOOT_SECONDS=5 QPSX_BENCHMARK_SECONDS=12
+	awk '/scanout-oracle/ { \
+		seq=0; distinct=0; nonblack=0; \
+		for (i=1; i<=NF; i++) { \
+			if ($$i ~ /^seq=/) { split($$i, a, "="); seq=a[2]+0; } \
+			if ($$i ~ /^distinct=/) { split($$i, b, "="); distinct=b[2]+0; } \
+			if ($$i ~ /^nonblack=/) { split($$i, c, "="); nonblack=c[2]+0; } \
+		} \
+		if (seq >= 60 && distinct >= 8 && nonblack >= 1000) visible=1; \
+	} END{exit !visible}' '$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
+	! grep -Eq 'Instruction bus error|Data bus error|fatal signal|signal 11|Kernel panic|frontend: fault|core (init|load|run) timeout' \
+		'$(BUILD_DIR)'/logs/linux-qpsx-attract-benchmark.log
+	@printf 'PASS smoke-linux-qpsx-attract-visual\n'
+
 benchmark-linux-qpsx-attract-dev:
 	$(MAKE) benchmark-linux-qpsx-attract \
 		QPSX_BENCHMARK_SD_TARGET=qpsx-dev-no-menu-test-sd \
 		QPSX_BENCHMARK_ASD_TARGET=linux-full-test-asd
+
+# Rec-phase translation now rejects pre-rec kernel TBs, so five host seconds
+# is enough to reach the browser while retaining a generous frame timeout.
+# Post-rec scope=all screens should override this timeout (typically 220s).
+QEMU_CACHE_MODEL_BOOT_SECONDS ?= 5
+QEMU_CACHE_MODEL_SECONDS ?= 45
+QEMU_CACHE_MODEL_FRAMES ?= 2700
+# A cache profile is compared at a fixed guest frame, so do not include the
+# normal benchmark's post-marker drain in the model's final sample.
+QEMU_CACHE_MODEL_POST_FRAME_SECONDS ?= 0
+QEMU_CACHE_MODEL_QEMU_ARGS ?=
+# Deterministic GE command-work counters for the same benchmark. Keep this
+# off by default; enabling it adds only sparse log lines and never changes GE
+# timing or guest-visible behavior.
+QEMU_GE_PROFILE ?= 0
+QEMU_CACHE_MODEL_ASD_TARGET ?= linux-full-test-asd
+QEMU_CACHE_MODEL_SD_TARGET ?= qpsx-no-menu-test-sd
+
+# Generate the explicit GTE map from the exact link map and ELF used by one
+# QEMU run.  Keep this opt-in and refuse to overwrite an existing output: a
+# control/candidate pair must carry distinct, verifiable maps.  The linker
+# map contains the specialized INTPL entry points as separate ranges; awk
+# emits each of them with the common architectural operation name.
+qemu-cache-gte-map:
+	@test -n '$(strip $(QEMU_CACHE_MODEL_GTE_LD_MAP))' || { \
+		echo 'set QEMU_CACHE_MODEL_GTE_LD_MAP to the exact linker map' >&2; exit 2; }
+	@test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))' || { \
+		echo 'set a unique QEMU_CACHE_MODEL_GTE_MAP output path' >&2; exit 2; }
+	@test -s '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'
+	@test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'
+	@test ! -e '$(QEMU_CACHE_MODEL_GTE_MAP)' || { \
+		echo 'refusing to overwrite existing GTE map; choose a new path' >&2; exit 2; }
+	mkdir -p '$(dir $(QEMU_CACHE_MODEL_GTE_MAP))'
+	core_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+	if grep -q 'gte_rtpt_asm[.]o' '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'; then asm_present=1; else asm_present=0; fi; \
+	{ \
+		printf '# sf2000-gte-map version=1 corebase=%s coresize=%s core_sha256=%s\n' \
+			'$(QEMU_CACHE_MODEL_COREBASE)' '$(QEMU_CACHE_MODEL_CORESIZE)' "$$core_sha"; \
+		awk -v asm_present="$$asm_present" ' \
+			function wanted(n) { \
+				return n == "gteRTPS" || n == "gteRTPT" || \
+					n == "gte_RTPT_asm" || \
+					n == "gteMVMVA" || n == "gteNCLIP" || \
+					n == "gteAVSZ3" || n == "gteAVSZ4" || \
+					n == "gteSQR" || n == "gteNCCS" || \
+					n == "gteNCCT" || n == "gteNCDS" || \
+					n == "gteNCDT" || n == "gteOP" || \
+					n == "gteDCPL" || n == "gteGPF" || \
+					n == "gteGPL" || n == "gteDPCS" || \
+					n == "gteDPCT" || n == "gteNCS" || \
+					n == "gteNCT" || n == "gteCC" || \
+					n == "gteINTPL" || n ~ /^gteINTPL_/ || \
+					n == "gteCDP" \
+			} \
+			function normalized(n) { \
+				if (n == "gte_RTPT_asm") return "rtpt"; \
+				n = tolower(n); sub(/^gte/, "", n); return n \
+			} \
+			function work(n) { \
+				return n == "gteRTPT" || n == "gte_RTPT_asm" || n == "gteNCCT" || \
+					n == "gteNCDT" || n == "gteDPCT" || n == "gteNCT" ? 3 : 1 \
+			} \
+			function source_record() { return /gte\.o/ || /gte_rtpt_asm\.o/ } \
+			source_record() && $$1 ~ /^0x/ && $$2 ~ /^0x/ { \
+				address = $$1; function_size = $$2; pending = 1; next \
+			} \
+			source_record() && $$2 ~ /^0x/ && $$3 ~ /^0x/ { \
+				address = $$2; function_size = $$3; pending = 1; next \
+			} \
+			pending { \
+				name = $$2; sub(/\(.*/, "", name); \
+				if (wanted(name) && !(asm_present && name == "gteRTPT")) print "gte " normalized(name) " " address " " function_size " " work(name); \
+				pending = 0 \
+			}' '$(QEMU_CACHE_MODEL_GTE_LD_MAP)'; \
+	} > '$(QEMU_CACHE_MODEL_GTE_MAP)'
+	for operation in rtps rtpt mvmva nclip avsz3 avsz4 sqr nccs ncct ncds ncdt op dcpl gpf gpl dpcs dpct ncs nct cc intpl cdp; do \
+		grep -q "^gte $$operation " '$(QEMU_CACHE_MODEL_GTE_MAP)' || { \
+			echo "GTE link map is missing $$operation" >&2; exit 2; }; \
+	done
+	@test "$$(grep -c '^gte ' '$(QEMU_CACHE_MODEL_GTE_MAP)')" -ge 22
+	@echo "wrote $(QEMU_CACHE_MODEL_GTE_MAP) for $(QEMU_CACHE_MODEL_GTE_ELF)"
+
+# Run the same no-input Ridge Racer attract workload with the diagnostic
+# plugin.  The plugin's output is cumulative and periodically flushed, so the
+# final sample remains available even when the monitor sends `quit` before
+# QEMU's normal plugin-exit callback runs.  Vary SIZE/LINE/WAYS for a profile
+# sweep; the default is the 16-KiB, 2-way, 16-byte-line VIPT profile reported
+# by physical SF2000/GB300 kernel logs. QEMU's stock 24Kc CP0 currently reports
+# 2 KiB, so pass QEMU_CACHE_MODEL_SIZE=2048 to model that QEMU mismatch.
+# `scope=rec` measures generated PlayStation blocks; `scope=core` measures the
+# static frontend/QPSX executable text in the small 0x83000000 window.
+# `scope=emu` combines both and retains callbacks for static functions already
+# translated before the first recRAM block, making it the default oracle.
+# `scope=all` remains a forensic mode because instrumenting Linux is slow.
+# The default recbase=auto window follows static Linux PIE layouts; pass an
+# exact QEMU_CACHE_MODEL_RECBASE when the core is deliberately linked outside
+# the normal 0x832xxxxx recMem window.
+benchmark-linux-qpsx-cache-model: qemu-cache-plugin
+	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
+	: > '$(QEMU_CACHE_MODEL_LOG)'
+	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		test -s '$(QEMU_CACHE_MODEL_GTE_MAP)'; test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'; \
+		elf_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+		sd_sha=$$(mtype -i '$(QPSX_REAL_TEST_SD)' ::/sf2000/cores/sf2000-qpsx | sha256sum | awk '{print $$1}'); \
+		test "$$elf_sha" = "$$sd_sha" || { echo 'GTE map ELF is not the core in the QEMU SD image' >&2; exit 2; }; \
+	fi
+	$(MAKE) run-linux-qpsx-attract-benchmark \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' \
+		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
+		QPSX_BENCHMARK_ASD_TARGET='$(QEMU_CACHE_MODEL_ASD_TARGET)' \
+		QPSX_BENCHMARK_SD_TARGET='$(QEMU_CACHE_MODEL_SD_TARGET)' \
+		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
+		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
+		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
+		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)$(QEMU_CACHE_MODEL_GTE_PLUGIN_ARGS)'"
+	test -s '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	test -n "$$logged_recbase" || { echo 'QEMU model: missing QPSX recMem fingerprint' >&2; exit 2; }; \
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' != auto; then \
+		test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
+		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }; \
+	fi
+	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	# The host monitor intentionally quits as soon as the core logs the exact
+	# endpoint, so it may preempt the frontend's next benchmark-limit message.
+	# The independent core progress line plus plugin frame record are the two
+	# correctness checks; requiring the racy third line rejects complete runs.
+	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
+	awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' '$(QEMU_CACHE_MODEL_LOG)'
+	! grep -Fq 'sf2000-cache-model: translation userdata cleanup mismatch' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.console'
+	@set -eu; \
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	reported_recbase=$$(sed -n 's/.*kind=frame .* recbase=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_status=$$(sed -n 's/.*kind=frame .* recbase_status=\([^ ]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_evidence=$$(sed -n 's/.*kind=frame .* recbase_evidence_pc=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	test -n "$$logged_recbase" -a -n "$$reported_recbase" \
+		-a -n "$$reported_status" -a -n "$$reported_evidence" || { \
+		echo 'QEMU model: missing recbase provenance in frame report' >&2; exit 2; }; \
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' = auto; then \
+		test "$$reported_status" = auto-first-rec-tb || { \
+			echo "QEMU model: auto recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_evidence))" || { \
+			echo "QEMU model: recMem=$$logged_recbase differs from evidence=$$reported_evidence" >&2; exit 2; }; \
+		test "$$((reported_recbase))" -eq "$$((reported_evidence))"; \
+	else \
+		test "$$reported_status" = configured-validated || { \
+			echo "QEMU model: configured recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_recbase))" || { \
+			echo "QEMU model: reported recbase=$$reported_recbase differs from recMem=$$logged_recbase" >&2; exit 2; }; \
+	fi
+	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		grep -Eq '^gte .*entries=[1-9][0-9]* .*map_status=ok ' \
+			'$(QEMU_CACHE_MODEL_LOG)' || { \
+			echo 'GTE oracle map produced no executed entry points' >&2; exit 2; \
+		}; \
+	fi
+	@tail -n 5 '$(QEMU_CACHE_MODEL_LOG)'
+	@test -s '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	@sed -n '1,12p' '$(QEMU_CACHE_MODEL_HOT_LOG)'
+
+# Fast iteration variant.  It deliberately has no ASD/SD build prerequisites:
+# prepare the no-menu image and uncapped ASD once, then sweep cache profiles or
+# core binaries without paying the image/kernel build cost on every run.
+benchmark-linux-qpsx-cache-model-fast: qemu-cache-plugin
+	test -s '$(QPSX_REAL_TEST_SD)'
+	if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		test -s '$(QEMU_CACHE_MODEL_GTE_MAP)'; test -s '$(QEMU_CACHE_MODEL_GTE_ELF)'; \
+		elf_sha=$$(sha256sum '$(QEMU_CACHE_MODEL_GTE_ELF)' | awk '{print $$1}'); \
+		sd_sha=$$(mtype -i '$(QPSX_REAL_TEST_SD)' ::/sf2000/cores/sf2000-qpsx | sha256sum | awk '{print $$1}'); \
+		test "$$elf_sha" = "$$sd_sha" || { echo 'GTE map ELF is not the core in the QEMU SD image' >&2; exit 2; }; \
+	fi
+	$(if $(and $(filter-out 0,$(QEMU_CACHE_MODEL_FRAMES)),$(filter 1,$(QPSX_BENCHMARK_REBUILD_ASD))),\
+	$(MAKE) --no-print-directory ROOTFS=full SDCARD_ASD_SYNC=0 \
+		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
+			LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' linux-full-test-asd,)
+	test -s '$(QPSX_BENCHMARK_ASD)'
+	mtype -i '$(QPSX_REAL_TEST_SD)' ::/cores/config/psx_startup.cfg | \
+		grep -q '^menu_at_start=0$$'
+	mkdir -p '$(dir $(QEMU_CACHE_MODEL_LOG))'
+	: > '$(QEMU_CACHE_MODEL_LOG)'
+	: > '$(QEMU_CACHE_MODEL_HOT_LOG)'
+	$(MAKE) --no-print-directory run-linux-qpsx-attract-benchmark \
+		QPSX_BENCHMARK_ASD_TARGET= QPSX_BENCHMARK_SD_TARGET= \
+		LINUX_CMDLINE='$(LINUX_DEFAULT_CMDLINE) SF2000_UNCAPPED=1 SF2000_BENCHMARK_FRAMES=$(QEMU_CACHE_MODEL_FRAMES) $(if $(strip $(QPSX_BENCHMARK_AUTO_LAUNCH)),SF2000_AUTO_LAUNCH=$(QPSX_BENCHMARK_AUTO_LAUNCH),)' \
+		QPSX_BENCHMARK_FRAMES='$(QEMU_CACHE_MODEL_FRAMES)' \
+		QPSX_BENCHMARK_BOOT_SECONDS='$(QEMU_CACHE_MODEL_BOOT_SECONDS)' \
+		QPSX_BENCHMARK_SECONDS='$(QEMU_CACHE_MODEL_SECONDS)' \
+		QPSX_BENCHMARK_POST_FRAME_SECONDS='$(QEMU_CACHE_MODEL_POST_FRAME_SECONDS)' \
+		QEMU_PERF_ARGS='$(QEMU_CACHE_MODEL_QEMU_ARGS)' \
+		QEMU_PLUGIN_ARGS="-plugin '$(QEMU_CACHE_PLUGIN),out=$(QEMU_CACHE_MODEL_LOG),size=$(QEMU_CACHE_MODEL_SIZE),line=$(QEMU_CACHE_MODEL_LINE),ways=$(QEMU_CACHE_MODEL_WAYS),dmode=$(QEMU_CACHE_MODEL_DMODE),imode=$(QEMU_CACHE_MODEL_IMODE),phase=$(QEMU_CACHE_MODEL_PHASE),scope=$(QEMU_CACHE_MODEL_SCOPE),sample=$(QEMU_CACHE_MODEL_SAMPLE),ipenalty=$(QEMU_CACHE_MODEL_IPENALTY),dpenalty=$(QEMU_CACHE_MODEL_DPENALTY),label=$(QEMU_CACHE_MODEL_LABEL),recbase=$(QEMU_CACHE_MODEL_RECBASE),recsize=$(QEMU_CACHE_MODEL_RECSIZE),corebase=$(QEMU_CACHE_MODEL_COREBASE),coresize=$(QEMU_CACHE_MODEL_CORESIZE),frameopcode=$(QEMU_CACHE_MODEL_FRAME_OPCODE),framereport=$(QEMU_CACHE_MODEL_FRAME_REPORT),framestop=$(QEMU_CACHE_MODEL_FRAME_STOP),hotspots=$(QEMU_CACHE_MODEL_HOT_LOG)$(QEMU_CACHE_MODEL_GTE_PLUGIN_ARGS)'"
+	test -s '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'QPSX: (build_id=|build knobs)' '$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	test -n "$$logged_recbase" || { echo 'QEMU model: missing QPSX recMem fingerprint' >&2; exit 2; }; \
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' != auto; then \
+		test "$$logged_recbase" = '$(QEMU_CACHE_MODEL_RECBASE)' || { \
+		echo "QEMU model: recbase=$$logged_recbase but configured $(QEMU_CACHE_MODEL_RECBASE); override QEMU_CACHE_MODEL_RECBASE" >&2; exit 2; }; \
+	fi
+	grep -Eq 'QPSX: retro_run progress: frame $(QEMU_CACHE_MODEL_FRAMES)$$' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log'
+	grep -Eq 'rec_i_accesses=[1-9][0-9]*' '$(QEMU_CACHE_MODEL_LOG)'
+	grep -Eq 'kind=frame .*frame=$(QEMU_CACHE_MODEL_FRAME_STOP) ' '$(QEMU_CACHE_MODEL_LOG)'
+	awk -f '$(QEMU_CACHE_MODEL_REPORT_CHECK)' '$(QEMU_CACHE_MODEL_LOG)'
+	! grep -Fq 'sf2000-cache-model: translation userdata cleanup mismatch' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.console'
+	@set -eu; \
+	logged_recbase=$$(sed -n 's/.*recMem=\([0-9a-fA-F]*\).*/0x\1/p' \
+		'$(BUILD_DIR)/logs/linux-qpsx-attract-benchmark.log' | head -n 1); \
+	reported_recbase=$$(sed -n 's/.*kind=frame .* recbase=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_status=$$(sed -n 's/.*kind=frame .* recbase_status=\([^ ]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	reported_evidence=$$(sed -n 's/.*kind=frame .* recbase_evidence_pc=\(0x[0-9a-fA-F]*\).*/\1/p' \
+		'$(QEMU_CACHE_MODEL_LOG)' | tail -n 1); \
+	test -n "$$logged_recbase" -a -n "$$reported_recbase" \
+		-a -n "$$reported_status" -a -n "$$reported_evidence" || { \
+		echo 'QEMU model: missing recbase provenance in frame report' >&2; exit 2; }; \
+	if test '$(QEMU_CACHE_MODEL_RECBASE)' = auto; then \
+		test "$$reported_status" = auto-first-rec-tb || { \
+			echo "QEMU model: auto recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_evidence))" || { \
+			echo "QEMU model: recMem=$$logged_recbase differs from evidence=$$reported_evidence" >&2; exit 2; }; \
+		test "$$((reported_recbase))" -eq "$$((reported_evidence))"; \
+	else \
+		test "$$reported_status" = configured-validated || { \
+			echo "QEMU model: configured recbase status=$$reported_status" >&2; exit 2; }; \
+		test "$$((logged_recbase))" -eq "$$((reported_recbase))" || { \
+			echo "QEMU model: reported recbase=$$reported_recbase differs from recMem=$$logged_recbase" >&2; exit 2; }; \
+	fi
+	@if test -n '$(strip $(QEMU_CACHE_MODEL_GTE_MAP))'; then \
+		grep -Eq '^gte .*entries=[1-9][0-9]* .*map_status=ok ' \
+			'$(QEMU_CACHE_MODEL_LOG)' || { \
+			echo 'GTE oracle map produced no executed entry points' >&2; exit 2; \
+		}; \
+	fi
+	@tail -n 3 '$(QEMU_CACHE_MODEL_LOG)'
+
+# Compare exact-frame oracle logs in one stable table. The first file is the
+# control; later rows report their modeled-cycle deltas at each common frame.
+# Starting at frame 900 excludes Ridge Racer's inexpensive pre-race lead-in.
+qpsx-cache-oracle-compare:
+	@test -n '$(strip $(QEMU_CACHE_COMPARE_LOGS))' || { \
+		echo 'set QEMU_CACHE_COMPARE_LOGS="control.log candidate.log ..."' >&2; exit 2; }
+	@for log in $(QEMU_CACHE_COMPARE_LOGS); do \
+		test -s "$$log" || { echo "missing oracle log: $$log" >&2; exit 2; }; \
+	done
+	@awk -v start='$(QEMU_CACHE_COMPARE_START_FRAME)' '\
+	function value(name, i,a) { \
+		for (i = 1; i <= NF; i++) { split($$i, a, "="); if (a[1] == name) return a[2] + 0 } \
+		return -1 \
+	} \
+	FNR == 1 { file_no++ } \
+	/^sample=.*kind=frame / { \
+		frame=value("frame"); if (frame < start) next; \
+		label=""; for (i=1; i<=NF; i++) if ($$i ~ /^label=/) { label=$$i; sub(/^label=/,"",label) } \
+		avg=value("frame_avg_cycles"); p95=value("frame_p95_cycles"); \
+		p98=value("frame_p98_cycles"); p99=value("frame_p99_cycles"); \
+		p999=value("frame_p999_cycles"); \
+		if (file_no == 1) { base[frame]=avg; delta=0 } \
+		else if (base[frame] > 0) delta=100*(avg/base[frame]-1); else next; \
+		printf "%-24s frame=%4d avg=%10d p95=%10d p98=%10d p99=%10d p999=%10d avg_delta=%+7.3f%%\n", \
+			label,frame,avg,p95,p98,p99,p999,delta \
+	}' $(QEMU_CACHE_COMPARE_LOGS)
 
 run-linux-gpsp-smc: gpsp-smc-test-roms
 	@case ' $(GPSP_SMC_TEST_MODES) ' in \
@@ -3823,6 +4389,76 @@ metrics-frontend:
 			gpsp, field("failures") + 0; \
 	} \
 	END { emit() } \
+	' '$(METRICS_LOG)'
+
+# Machine-readable physical benchmark detail.  The historical metrics-frontend
+# summary intentionally keeps one row per session, but its session-wide maximum
+# cannot answer whether a candidate improved the difficult 1200..2700 phase.
+# Preserve each cumulative checkpoint, its interval delta, and each 300-frame
+# histogram.  A decreasing frame counter (including a tail record that arrives
+# before the next audio record) starts a new session, so repeated tests in one
+# log remain independently attributable.
+metrics-frontend-detail:
+	@awk '\
+	function field(name,   i,p) { \
+		for (i = 1; i <= NF; i++) { \
+			p = index($$i, "="); \
+			if (p && substr($$i, 1, p - 1) == name) return substr($$i, p + 1); \
+		} \
+		return ""; \
+	} \
+	function end_session(   unused) { \
+		if (!session_seen) return; \
+		printf "frontend.detail.session.%u.end_frames=%u\n", session, last_frames; \
+		printf "frontend.detail.session.%u.end_elapsed_ms=%u\n", session, last_elapsed; \
+	} \
+	function new_session(   unused) { \
+		end_session(); session++; session_seen = 0; \
+		last_frames = last_elapsed = -1; \
+		last_tail = -1; \
+	} \
+	/source=frontend-metric audio metric/ { \
+		frames = field("frames") + 0; elapsed = field("elapsed_ms") + 0; \
+		# cpu_process_us, late_frames, and sampled_* are interval values: the \
+		# frontend resets their baselines after every 300-frame report. \
+		cpu = field("cpu_process_us") + 0; late = field("late_frames") + 0; \
+		if (session_seen && (frames < last_frames || field("mode") != mode)) new_session(); \
+		mode = field("mode"); session_seen = 1; \
+		printf "frontend.detail.session.%u.checkpoint.%u.frames=%u\n", session, frames, frames; \
+		printf "frontend.detail.session.%u.checkpoint.%u.elapsed_ms=%u\n", session, frames, elapsed; \
+		printf "frontend.detail.session.%u.checkpoint.%u.fps=%.3f\n", session, frames, field("fps_milli") / 1000; \
+		printf "frontend.detail.session.%u.checkpoint.%u.cpu_process_us=%u\n", session, frames, cpu; \
+		printf "frontend.detail.session.%u.checkpoint.%u.sampled_max_run_us=%u\n", session, frames, field("sampled_max_run_us") + 0; \
+		printf "frontend.detail.session.%u.checkpoint.%u.sampled_present_us=%u\n", session, frames, field("sampled_present_us") + 0; \
+		printf "frontend.detail.session.%u.checkpoint.%u.late_frames=%u\n", session, frames, late; \
+		if (last_frames >= 0 && elapsed > last_elapsed) { \
+			df = frames - last_frames; dm = elapsed - last_elapsed; dc = cpu; dl = late; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_frames=%u\n", session, frames, df; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_ms=%u\n", session, frames, dm; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_fps=%.3f\n", session, frames, df * 1000 / dm; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_cpu_process_us=%u\n", session, frames, dc; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_cpu_pct=%.3f\n", session, frames, dc * 100 / dm / 1000; \
+			printf "frontend.detail.session.%u.checkpoint.%u.interval_late_frames=%u\n", session, frames, dl; \
+		} \
+		last_frames = frames; last_elapsed = elapsed; \
+	} \
+	/source=frontend-metric frame-tail/ { \
+		tail = field("video_frames") + 0; \
+		if (last_tail >= 0 && tail < last_tail) new_session(); \
+		printf "frontend.detail.session.%u.tail.%u.samples=%u\n", session, tail, field("samples") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.avg_us=%u\n", session, tail, field("avg_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p95_us=%u\n", session, tail, field("p95_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p98_us=%u\n", session, tail, field("p98_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p99_us=%u\n", session, tail, field("p99_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.p999_us=%u\n", session, tail, field("p999_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_avg_us=%u\n", session, tail, field("core_avg_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p95_us=%u\n", session, tail, field("core_p95_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p98_us=%u\n", session, tail, field("core_p98_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p99_us=%u\n", session, tail, field("core_p99_us") + 0; \
+		printf "frontend.detail.session.%u.tail.%u.core_p999_us=%u\n", session, tail, field("core_p999_us") + 0; \
+		last_tail = tail; \
+	} \
+	END { end_session() } \
 	' '$(METRICS_LOG)'
 
 benchmark-qemu-linux: qemu linux-full-asd
