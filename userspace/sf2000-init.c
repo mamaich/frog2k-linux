@@ -103,6 +103,18 @@ static char *const storage_argv[] = {
 	"/usr/sbin/sf2000-mount", 0
 };
 static char *const fb_test_argv[] = { "/usr/bin/fb-test", "-p", "0", 0 };
+/*
+ * Diagnostic login on the kernel console, next to the normal application.
+ * getty owns the tty itself and hands over to login, so the shell never
+ * competes with the frontend for the keypad.  Services here are spawned once
+ * and not restarted, so the loop belongs in the service itself: without it the
+ * console goes quiet after the first logout or login timeout.  The loop also
+ * has to survive the SIGHUP that ends each login session, hence the trap.
+ */
+static char *const console_shell_argv[] = {
+	"/bin/sh", "-c",
+	"trap '' HUP; while :; do /sbin/getty -L ttyS0 115200 vt100; done", 0
+};
 static char *const init_envp[] = {
 	"HOME=/",
 	"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
@@ -119,6 +131,7 @@ static unsigned long audio_stack[SERVICE_STACK_WORDS];
 static unsigned long logd_stack[SERVICE_STACK_WORDS];
 static unsigned long storage_late_stack[SERVICE_STACK_WORDS];
 static unsigned long fb_test_stack[SERVICE_STACK_WORDS];
+static unsigned long console_shell_stack[SERVICE_STACK_WORDS];
 
 static void log_message(const char *message);
 extern long sf2000_clone_service(unsigned long child_stack, char *const argv[]);
@@ -893,6 +906,9 @@ int main(void)
 		pad_stack);
 	spawn_service("sf2000_userspace: starting power coordinator\n", powerd_argv,
 		powerd_stack);
+	if (cmdline_contains("SF2000_CONSOLE_SHELL=1"))
+		spawn_service("sf2000_userspace: starting console shell\n",
+			console_shell_argv, console_shell_stack);
 	if (cmdline_contains("SF2000_AUDIO_TEST=1"))
 		spawn_service("sf2000_userspace: starting audio DMA test\n",
 			audio_argv, audio_stack);

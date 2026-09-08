@@ -263,6 +263,25 @@ working console instead of stopping it for diagnostic test screens. Append
 The broad MCU/GE and G1-G8 cards are available with `SF2000_GE_DIAG=1`, but
 normal boot does not display or depend on them.
 
+`SF2000_CONSOLE_SHELL=1` adds a login on the serial console next to the normal
+application: init keeps starting the display, input, storage and frontend
+services as usual and additionally runs a getty on `ttyS0`, so the browser or a
+running core can be inspected from a shell. The command line is built into the
+kernel, so this is a build-time choice like the flags above:
+
+```sh
+make ROOTFS=full SDCARD_ASD_SYNC=0 \
+	LINUX_CMDLINE='console=ttyS0,115200 earlycon init=/init initramfs_async=0 \
+SF2000_BOOT_VISUAL=browser SF2000_BOOT_COLOR=0x0000 SF2000_BOOT_HOLD_MS=750 \
+SF2000_CONSOLE_SHELL=1' \
+	LINUX_ASD=build/sf2000-linux-app-shell.asd linux-asd
+```
+
+Log in as `root` with an empty password. The shell owns the serial port only,
+so the keypad still belongs to the frontend. `/proc` is not mounted on this
+boot path, so `mount -t proc proc /proc` first if `ps` or `free` are needed.
+Normal images are unaffected: without the flag no getty is started.
+
 The missing production operation was found by tracing the closed firmware:
 before its first GMA doorbell it clears the exact future scanout bitmap through
 GE. The visible E2 diagnostic had accidentally done that in every sharp test
