@@ -164,6 +164,9 @@ are documented in
 The signal-delivery defect that kept every user process from receiving signals,
 its measurements and the address-range fix are documented in
 [`docs/NOMMU-SIGNAL-DELIVERY.md`](docs/NOMMU-SIGNAL-DELIVERY.md).
+The `/proc` process-access hang that froze the board on `ps`, and the NULL-page
+path it needed in the MIPS copy helpers, are documented in
+[`docs/NOMMU-PROC-ACCESS.md`](docs/NOMMU-PROC-ACCESS.md).
 The disposable build layout, external toolchain verification, and the reason
 the no-MMU static-ELF toolchain is required are documented in
 [`docs/BUILD-LAYOUT.md`](docs/BUILD-LAYOUT.md).

@@ -1,0 +1,61 @@
+From: SF2000 Linux <sf2000@localhost>
+Subject: [PATCH] mips: tolerate a NULL page in the user-page copy helpers
+
+NOMMU access_remote_vm() copies straight through the target mapping and has no
+struct page to pass, so mm/nommu.c calls copy_to_user_page() and
+copy_from_user_page() with page == NULL. Both MIPS implementations start with
+page_folio(page), which walks a struct page at a small fixed offset from zero,
+and the caller then hangs the machine: reading /proc/<pid>/cmdline froze the
+guest until the watchdog reset it, which is what "ps" does for every process.
+
+Upstream never sees this because MIPS has no NOMMU support there.
+
+Copy by address when there is no page. Nothing has to be kept coherent with a
+page cache in that case; the executable mapping still needs its icache flushed,
+so do that by range.
+
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -202,7 +202,23 @@
+ 	struct page *page, unsigned long vaddr, void *dst, const void *src,
+ 	unsigned long len)
+ {
+-	struct folio *folio = page_folio(page);
++	struct folio *folio;
++
++	/*
++	 * NOMMU access_remote_vm() copies straight through the target
++	 * mapping and has no page to hand over.  There is no page cache to
++	 * keep coherent in that case, so copy and flush by address only;
++	 * page_folio(NULL) would walk a bogus struct page.
++	 */
++	if (!page) {
++		memcpy(dst, src, len);
++		if (vma->vm_flags & VM_EXEC)
++			flush_icache_range((unsigned long)dst,
++					   (unsigned long)dst + len);
++		return;
++	}
++
++	folio = page_folio(page);
+ 
+ 	if (cpu_has_dc_aliases &&
+ 	    folio_mapped(folio) && !folio_test_dcache_dirty(folio)) {
+@@ -222,7 +238,15 @@
+ 	struct page *page, unsigned long vaddr, void *dst, const void *src,
+ 	unsigned long len)
+ {
+-	struct folio *folio = page_folio(page);
++	struct folio *folio;
++
++	/* NOMMU: no page to keep coherent, see copy_to_user_page(). */
++	if (!page) {
++		memcpy(dst, src, len);
++		return;
++	}
++
++	folio = page_folio(page);
+ 
+ 	if (cpu_has_dc_aliases &&
+ 	    folio_mapped(folio) && !folio_test_dcache_dirty(folio)) {
