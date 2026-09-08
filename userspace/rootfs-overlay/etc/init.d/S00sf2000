@@ -2,6 +2,11 @@
 
 case "$1" in
 	start)
+		# The loader arms a watchdog before entering the kernel and the
+		# project's own init clears it once userspace is alive.  Any init
+		# that only runs these scripts has to do the same or the board
+		# resets mid-session.
+		/usr/sbin/sf2000-wdt disable 2>/dev/null || true
 		mkdir -p /proc /sys /dev/pts /dev/shm /run/lock/subsys
 		mount -t proc proc /proc 2>/dev/null || true
 		mount -t sysfs sysfs /sys 2>/dev/null || true

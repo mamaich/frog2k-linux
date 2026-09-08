@@ -146,8 +146,29 @@ service and gained the `stop` case the neighbouring scripts have, so both entry
 points work: the project's own init still spawns the binary itself, and `rcS`
 reaches `sf2000_rcS: done` with the card mounted at `/mnt/sd`.
 
-One caveat remains for the BusyBox-init diagnostic path only: nothing there
-performs the `early_watchdog_disable()` the project's init does, so the board
-resets on the hardware watchdog once the display service owns the panel. The
-normal `init=/init` image is unaffected and logs
+## Watchdog handling for init implementations other than our own
+
+The loader arms a 20-second watchdog before entering the kernel, and the
+project's own init clears it from `early_watchdog_disable()` as soon as
+userspace is alive. An init that only runs the `/etc/init.d` scripts has no
+equivalent step, so the board used to reset in the middle of a console
+session.
+
+`userspace/sf2000-wdt.c` is a ~70-line static-PIE utility installed as
+`/usr/sbin/sf2000-wdt`. It writes the same two registers in the same order as
+init - clear the counter at `0x18818500`, then the configuration byte at
+`0x18818504` - and falls back to the uncached KSEG1 alias exactly like init
+does when `/dev/mem` is unavailable, which it always is because
+`CONFIG_DEVMEM` is off. `S00sf2000` calls it before anything else starts, so
+any init that runs the scripts in the usual way gets the same guarantee and
+BusyBox itself needs no patching.
+
+Services that arm a watchdog of their own are untouched by this: the display
+service keeps arming, petting and disarming its 8-second runtime watchdog
+around its draw loop and its pause handshake.
+
+Verified with BusyBox init: `sf2000_rcS: done`, a single loader start after 90
+seconds of idle console (previously the log showed repeated restarts), and a
+shell session that still runs external commands afterwards. The normal
+`init=/init` image is unchanged and keeps logging
 `sf2000_userspace: early watchdog disabled`.
