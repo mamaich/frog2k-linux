@@ -281,9 +281,11 @@ SF2000_CONSOLE_SHELL=1' \
 ```
 
 Log in as `root` with an empty password. The shell owns the serial port only,
-so the keypad still belongs to the frontend. `/proc` is not mounted on this
-boot path, so `mount -t proc proc /proc` first if `ps` or `free` are needed.
-Normal images are unaffected: without the flag no getty is started.
+so the keypad still belongs to the frontend. `/proc` and `/dev` are already
+available on every boot, and this flag additionally mounts `sysfs` on `/sys`,
+which the shipped services do not need but `ps`, `dmesg` and the block-device
+listings do. Normal images are unaffected: without the flag no getty is started
+and no extra filesystem is mounted.
 
 The missing production operation was found by tracing the closed firmware:
 before its first GMA doorbell it clears the exact future scanout bitmap through

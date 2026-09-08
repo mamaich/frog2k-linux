@@ -546,13 +546,35 @@ static int path_exists(const char *path)
 	return 1;
 }
 
-static int mount_procfs(void)
+static int mount_fs(const char *source, const char *target, const char *type)
 {
-	(void)mkdir_path("/proc", 0755);
-	if (syscall6(SYS_mount, (long)"proc", (long)"/proc", (long)"proc",
+	(void)mkdir_path(target, 0755);
+	if (syscall6(SYS_mount, (long)source, (long)target, (long)type,
 			0, (long)"", 0) == 0)
 		return 0;
 	return -1;
+}
+
+static int mount_procfs(void)
+{
+	return mount_fs("proc", "/proc", "proc");
+}
+
+/*
+ * Filesystems the shipped services do not need but a console session does.
+ * /proc is already mounted by the time this runs, and the kernel mounts
+ * devtmpfs on /dev before init starts, so only mount what is missing.
+ */
+static void mount_diagnostic_filesystems(void)
+{
+	if (!path_exists("/sys/kernel") &&
+	    mount_fs("sysfs", "/sys", "sysfs") == 0)
+		log_message("sf2000_userspace: sysfs mounted\n");
+	if (!path_exists("/dev/console") &&
+	    mount_fs("devtmpfs", "/dev", "devtmpfs") == 0)
+		log_message("sf2000_userspace: devtmpfs mounted\n");
+	if (!path_exists("/proc/self/stat") && mount_procfs() == 0)
+		log_message("sf2000_userspace: procfs mounted\n");
 }
 
 static int cmdline_contains(const char *needle)
@@ -906,9 +928,11 @@ int main(void)
 		pad_stack);
 	spawn_service("sf2000_userspace: starting power coordinator\n", powerd_argv,
 		powerd_stack);
-	if (cmdline_contains("SF2000_CONSOLE_SHELL=1"))
+	if (cmdline_contains("SF2000_CONSOLE_SHELL=1")) {
+		mount_diagnostic_filesystems();
 		spawn_service("sf2000_userspace: starting console shell\n",
 			console_shell_argv, console_shell_stack);
+	}
 	if (cmdline_contains("SF2000_AUDIO_TEST=1"))
 		spawn_service("sf2000_userspace: starting audio DMA test\n",
 			audio_argv, audio_stack);
