@@ -135,12 +135,19 @@ BusyBox `init` never showed the failure because it does not install signal
 handlers; the project's own init spawns services with a raw `clone()` and polls
 for their state, so it never depended on signal delivery either.
 
-## Follow-up, not addressed here
+## Storage service under BusyBox init
 
-`userspace/rootfs-overlay/etc/init.d/S05sf2000-storage` runs
+`userspace/rootfs-overlay/etc/init.d/S05sf2000-storage` used to run
 `exec /usr/sbin/sf2000-mount`, which never returns because the mount service is
-an endless hotplug loop. Under BusyBox `init` that blocks `rcS` forever; the
-script needs to background the service. This never showed before because the
-shell running `rcS` was killed by the defect above, which let `init` continue to
-`getty`. The project's normal init executes that service directly and is not
-affected.
+an endless hotplug loop; under BusyBox `init` that blocked `rcS` forever. It
+never showed before because the shell running `rcS` was killed by the defect
+above, which let `init` continue to `getty`. The script now backgrounds the
+service and gained the `stop` case the neighbouring scripts have, so both entry
+points work: the project's own init still spawns the binary itself, and `rcS`
+reaches `sf2000_rcS: done` with the card mounted at `/mnt/sd`.
+
+One caveat remains for the BusyBox-init diagnostic path only: nothing there
+performs the `early_watchdog_disable()` the project's init does, so the board
+resets on the hardware watchdog once the display service owns the panel. The
+normal `init=/init` image is unaffected and logs
+`sf2000_userspace: early watchdog disabled`.

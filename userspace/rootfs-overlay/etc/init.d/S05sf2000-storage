@@ -1,6 +1,18 @@
 #!/bin/sh
 
-# BusyBox-init compatibility; the normal NOMMU init executes this static ELF
-# directly to avoid relocating the much larger shell during boot.
-[ "$1" = start ] || exit 0
-exec /usr/sbin/sf2000-mount
+# BusyBox-init compatibility; the normal NOMMU init spawns this static ELF
+# itself to avoid relocating the much larger shell during boot.
+#
+# sf2000-mount is an endless hotplug service, so it has to be backgrounded
+# here: a foreground exec would never return and would stall the rest of rcS.
+
+case "$1" in
+	start)
+		echo "Starting sf2000-mount: "
+		/usr/sbin/sf2000-mount &
+		echo "OK"
+		;;
+	stop)
+		killall sf2000-mount 2>/dev/null || true
+		;;
+esac
