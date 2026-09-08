@@ -161,6 +161,9 @@ support matrix, and application-porting constraints are documented in
 The log78/log89 stale-display-artifact incident and its reproducibility rules
 are documented in
 [`docs/DISPLAY-INCIDENT-LOG78-LOG89.md`](docs/DISPLAY-INCIDENT-LOG78-LOG89.md).
+The signal-delivery defect that kept every user process from receiving signals,
+its measurements and the address-range fix are documented in
+[`docs/NOMMU-SIGNAL-DELIVERY.md`](docs/NOMMU-SIGNAL-DELIVERY.md).
 The disposable build layout, external toolchain verification, and the reason
 the no-MMU static-ELF toolchain is required are documented in
 [`docs/BUILD-LAYOUT.md`](docs/BUILD-LAYOUT.md).
