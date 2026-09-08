@@ -115,6 +115,11 @@ Project gates, all on the fixed kernel:
 Rollback point: dropping the patch file restores the previous behaviour
 exactly; nothing outside the patch was changed.
 
+Delivering signals made two latent problems visible, both fixed separately:
+`/proc/<pid>/cmdline` reads froze the board, see
+[`NOMMU-PROC-ACCESS.md`](NOMMU-PROC-ACCESS.md), and the storage init script
+blocked `rcS` because it had never run to completion before.
+
 ## Ruled out during the investigation
 
 Recorded so the same ground is not covered twice. None of these reproduce the

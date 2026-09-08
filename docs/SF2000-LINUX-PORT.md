@@ -38,8 +38,9 @@ therefore means source-portable programs that do not require:
 - virtual-memory features such as arbitrary file-backed mappings;
 - more RAM or CPU than the handheld can provide.
 
-Programs using `vfork()`/`exec()`, threads supported by the selected uClibc
-configuration, ordinary files, evdev, ALSA, and fbdev can be ported. Keep
+Programs using `vfork()`/`exec()`, POSIX signal handlers, threads supported by
+the selected uClibc configuration, ordinary files, evdev, ALSA, and fbdev can be
+ported. Keep
 executables small: on NOMMU each program is allocated as a contiguous image,
 so a tiny dedicated helper starts much faster than a large multi-call binary.
 Static PIE images are contiguous allocations on NOMMU. The packaged QPSX and
@@ -98,7 +99,16 @@ code to be useful, but the SF2000 execution environment is not a conventional
 - restoring interrupts in the NOMMU syscall path;
 - rearming a CP0 Compare value that was already pending at the first interrupt
   enable;
-- flushing warm-boot kernel aliases before transferring control.
+- flushing warm-boot kernel aliases before transferring control;
+- recognising a return to userspace by the running task's image range, since
+  NOMMU user code executes in kernel mode and `KU_USER` cannot make that
+  distinction; the earlier fixed address window matched no static-PIE image, so
+  signals were never delivered to any process at all, see
+  [`NOMMU-SIGNAL-DELIVERY.md`](NOMMU-SIGNAL-DELIVERY.md);
+- tolerating the NULL `struct page` that NOMMU `access_remote_vm()` hands to
+  the MIPS user-page copy helpers, which otherwise froze the board on any
+  `/proc/<pid>/cmdline` read, see
+  [`NOMMU-PROC-ACCESS.md`](NOMMU-PROC-ACCESS.md).
 
 These changes are represented as ordered patches under
 `patches/linux-7.1.4/`. Many retained markers are intentionally still present:

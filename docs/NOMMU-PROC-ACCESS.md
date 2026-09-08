@@ -6,6 +6,10 @@ Reading another process's command line froze the board until the watchdog reset
 it. `ps` does that for every entry it lists, so the whole tool was unusable and
 took the system down with it.
 
+It only became reachable once signals were delivered again, see
+[`NOMMU-SIGNAL-DELIVERY.md`](NOMMU-SIGNAL-DELIVERY.md): before that a shell
+died before it could run `ps` at all.
+
 ## Symptom
 
 With `/proc` mounted, from a console shell:
